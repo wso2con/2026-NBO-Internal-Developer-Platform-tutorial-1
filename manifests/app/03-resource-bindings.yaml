@@ -1,0 +1,50 @@
+# D2 (part 2) — PLACE each Resource in the development environment.
+#
+# A binding says WHERE a resource runs. It does not say WHICH release: that is
+# promotion, and it is a separate, deliberate act:
+#
+#   occ apply -f 22-resource-bindings.yaml
+#   occ resource promote loans-db    --env development -n kifaru-bank
+#   occ resource promote loan-events --env development -n kifaru-bank
+#   occ resource promote disb-claims --env development -n kifaru-bank
+#
+# Until promoted, a binding reports Synced=False "spec.resourceRelease is unset;
+# pin a ResourceRelease to deploy this binding". promote reads the resource's
+# status.latestRelease and pins it — no hash is ever copied by hand, and git
+# never carries one. Re-run promote after changing a Resource's parameters.
+#
+# Staging and production need their own copies with `environment:` changed and
+# their own promote — a Resource placed in development runs in development only.
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ResourceReleaseBinding
+metadata:
+  name: loans-db-development
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+    resourceName: loans-db
+  environment: development
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ResourceReleaseBinding
+metadata:
+  name: loan-events-development
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+    resourceName: loan-events
+  environment: development
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ResourceReleaseBinding
+metadata:
+  name: disb-claims-development
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+    resourceName: disb-claims
+  environment: development

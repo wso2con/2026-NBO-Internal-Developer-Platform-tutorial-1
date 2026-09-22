@@ -1,0 +1,23 @@
+# Secrets and local config — never committed (BUILD-SPEC.md §2.7)
+.env
+
+# Ballerina build output
+app/*/target/
+app/*/Dependencies.toml
+
+# Go build output. `go build` with no -o drops a binary named after the module at
+# the module root, which is easy to commit by accident — 57MB of them, once.
+app/*/bin/
+app/disbursement-worker/disbursement-worker
+app/arrears-eod/arrears-eod
+app/payment-rail-stub/payment-rail-stub
+app/loan-application-portal/loan-application-portal
+app/loan-officer-console/loan-officer-console
+
+# Node / Vite
+app/*/node_modules/
+app/*/dist/
+app/*/.vite/
+
+# macOS
+.DS_Store

@@ -1,0 +1,388 @@
+===============================================================================
+ KIFARU BANK LENDING DEMO — PHASE 1 MANUAL TEST PLAN
+ Data layer only (schema, seed, constraints). No application services yet.
+===============================================================================
+
+This is a developer verification aid for Phase 1. It is NOT demo/RUNBOOK.md —
+that is the presenter's on-stage script and BUILD-SPEC.md §13 says it is written
+in Phase 7, not before.
+
+WHAT PHASE 1 COVERS
+  - postgres / nats / valkey come up healthy
+  - the §5 schema applies cleanly
+  - the four seeded loans land in the four overdue buckets (§5 seed table)
+  - repayment schedules are arithmetically correct (flat 18% p.a.)
+  - seeding is idempotent
+  - database constraints reject bad data
+
+WHAT IS NOT TESTABLE YET  (and the phase that brings it)
+  - POST /applications, scoring, 201/200 idempotency ....... phase 3 (loan-api)
+  - score 712 / 480 golden fixtures ................. phase 2 (credit-scoring)
+  - NATS publish + JetStream LOANS stream ................. phase 3
+  - duplicate disbursement suppression .......... phase 4 (disbursement-worker)
+  - the arrears table printed to stdout ............... phase 5 (arrears-eod)
+  - the three console screens ................... phase 6 (loan-officer-console)
+  - make smoke (all five scenarios) ....................... phase 3 onward
+  - make verify-hardened (needs built images) ............. phase 2 onward
+
+In Phase 1 there is no HTTP API, so "adding a new record" in PART B is done
+with SQL. From Phase 3 the same thing is done by POSTing to loan-api instead.
+
+-------------------------------------------------------------------------------
+ IMPORTANT — SEED FRESHLY ON THE DAY YOU TEST
+-------------------------------------------------------------------------------
+The seed computes due dates relative to CURRENT_DATE *at the moment it runs*
+(§5 forbids absolute date literals). The stored dates are then fixed, so the
+days-past-due you observe drifts forward as real days pass:
+
+    seeded today,    tested today     ->  DPD  12 /  47 /  78 / 124   (correct)
+    seeded Monday,   tested Thursday  ->  DPD  15 /  50 /  81 / 127   (drifted)
+
+That is correct behaviour, not a bug — but every expected value below assumes
+the seed ran on the same calendar day. If a day has passed since you last
+seeded, re-run step 0.4 before trusting any DPD number.
+
+===============================================================================
+ PART 0 — PREFLIGHT
+===============================================================================
+
+All commands run from:
+    cd <repo>/tutorial-1
+
+0.1  Check the VM and toolchain.
+
+        make doctor
+
+     EXPECT: every line starts "OK", final line "doctor: clean".
+     If it says colima is not running, start it with the command it prints.
+
+0.2  Bring up the infrastructure.
+
+        make up
+
+     EXPECT: postgres, nats and valkey all reach "(healthy)".
+     `make up` uses `--wait`, so it does not return until they are healthy.
+     Nothing is built here — Phase 1 has no service images.
+
+0.3  Load the host psql environment. Do this once per terminal; every psql
+     command below depends on it.
+
+        set -a && . ./.env && set +a
+
+     If .env does not exist, `make up` created it from .env.example.
+
+0.4  Apply migrations and seed (safe to re-run; see the warning above).
+
+        make seed
+
+     EXPECT: "migrate: applying 001_init.sql" on a fresh database, or
+     "migrate: schema already present, skipping migrations" afterwards, then
+     "migrate: seeding", a four-row summary table, and "migrate: done".
+
+0.5  Confirm you can reach the database from the host.
+
+        psql -c "SELECT current_database(), current_user;"
+
+     EXPECT: kifaru | kifaru
+
+===============================================================================
+ PART A — VERIFY THE EXISTING SEEDED RECORDS   (read-only, nothing is changed)
+===============================================================================
+
+A.1  All four tables exist.
+
+        psql -c "\dt"
+
+     EXPECT: exactly four tables —
+       arrears_classification, disbursements, loan_applications, repayments
+
+A.2  Exactly four loans, all APPROVED.
+
+        psql -c "SELECT application_id, applicant_name, amount_kes, term_months,
+                        score, decision
+                   FROM loan_applications ORDER BY application_id;"
+
+     EXPECT 4 rows, every decision = APPROVED:
+       APP-100301  Joseph M.   150000.00  24  666  APPROVED
+       APP-100302  Grace N.    250000.00  24  708  APPROVED
+       APP-100303  Peter O.    120000.00  12  680  APPROVED
+       APP-100304  Halima S.   480000.00  36  750  APPROVED
+
+A.3  APP-100244 and APP-100245 are deliberately absent (§5 — scenarios 1 and 3
+     create them at runtime from Phase 3 onward).
+
+        psql -c "SELECT COUNT(*) FROM loan_applications
+                  WHERE application_id IN ('APP-100244','APP-100245');"
+
+     EXPECT: 0
+
+A.4  THE KEY TEST — days past due and bucket per loan.
+
+        psql -c "
+        SELECT l.application_id, l.applicant_name,
+               (CURRENT_DATE - MIN(r.due_date) FILTER (WHERE r.paid_date IS NULL)) AS dpd,
+               CASE
+                 WHEN (CURRENT_DATE - MIN(r.due_date) FILTER (WHERE r.paid_date IS NULL)) <= 0  THEN 'CURRENT'
+                 WHEN (CURRENT_DATE - MIN(r.due_date) FILTER (WHERE r.paid_date IS NULL)) <= 30 THEN 'DPD_1_30'
+                 WHEN (CURRENT_DATE - MIN(r.due_date) FILTER (WHERE r.paid_date IS NULL)) <= 60 THEN 'DPD_31_60'
+                 WHEN (CURRENT_DATE - MIN(r.due_date) FILTER (WHERE r.paid_date IS NULL)) <= 90 THEN 'DPD_61_90'
+                 ELSE 'NPL_90_PLUS'
+               END AS bucket,
+               SUM(r.amount_due_kes) FILTER (WHERE r.paid_date IS NULL) AS outstanding
+          FROM loan_applications l JOIN repayments r ON r.application_id = l.application_id
+         GROUP BY 1,2 ORDER BY dpd DESC;"
+
+     EXPECT exactly this (assuming same-day seed):
+       APP-100304  Halima S.   124  NPL_90_PLUS   616000.02
+       APP-100303  Peter O.     78  DPD_61_90     106200.00
+       APP-100302  Grace N.     47  DPD_31_60     269166.65
+       APP-100301  Joseph M.    12  DPD_1_30      136000.00
+
+     This is what §10.6 asserts: one loan per overdue bucket, and exactly one
+     loan in NPL_90_PLUS.
+
+     NOTE: these outstanding figures now match §7.4's table — the spec was
+     updated to the values §5's rules actually produce. The earlier example
+     amounts (128,500 / 212,000 / 96,750 / 415,200) were not multiples of their
+     loan's instalment, so no paid-count could produce them.
+
+A.5  Schedule arithmetic — every schedule must sum to its total repayable under
+     the flat 18% p.a. rule, with the rounding remainder on the final instalment.
+
+        psql -c "
+        SELECT l.application_id, l.term_months, COUNT(r.*) AS instalments,
+               ROUND(l.amount_kes * (1 + 0.18 * l.term_months / 12.0), 2) AS expected_total,
+               SUM(r.amount_due_kes) AS schedule_sum,
+               (SUM(r.amount_due_kes)
+                  = ROUND(l.amount_kes * (1 + 0.18 * l.term_months / 12.0), 2)) AS sums_match
+          FROM loan_applications l JOIN repayments r ON r.application_id = l.application_id
+         GROUP BY 1,2, l.amount_kes ORDER BY 1;"
+
+     EXPECT sums_match = t on all four rows:
+       APP-100301  24  24  204000.00  204000.00  t
+       APP-100302  24  24  340000.00  340000.00  t
+       APP-100303  12  12  141600.00  141600.00  t
+       APP-100304  36  36  739200.00  739200.00  t
+
+     Spot-check one by hand: 150,000 x (1 + 0.18 x 24/12) = 150,000 x 1.36
+     = 204,000, over 24 instalments = 8,500.00 each.
+
+A.6  Paid / unpaid split. The oldest unpaid instalment is what sets the DPD;
+     everything before it is paid on its due date.
+
+        psql -c "
+        SELECT application_id,
+               COUNT(*) FILTER (WHERE paid_date IS NOT NULL) AS paid,
+               COUNT(*) FILTER (WHERE paid_date IS NULL)     AS unpaid,
+               MIN(instalment_no) FILTER (WHERE paid_date IS NULL) AS first_unpaid
+          FROM repayments GROUP BY 1 ORDER BY 1;"
+
+     EXPECT:
+       APP-100301   8  16   9
+       APP-100302   5  19   6
+       APP-100303   3   9   4
+       APP-100304   6  30   7
+
+A.7  No absolute date literals leaked into the seed. Every due date must be
+     expressible as an offset from today, and the anchor instalment must sit
+     exactly its target DPD in the past.
+
+        grep -nE "'20[0-9]{2}-[0-9]{2}-[0-9]{2}'" db/seed/seed.sql
+
+     EXPECT: no output (exit status 1). Any hit is a §5 violation.
+
+A.8  Row count totals.
+
+        psql -c "SELECT
+                   (SELECT COUNT(*) FROM loan_applications) AS loans,
+                   (SELECT COUNT(*) FROM disbursements)     AS disbursements,
+                   (SELECT COUNT(*) FROM repayments)        AS repayments,
+                   (SELECT COUNT(*) FROM arrears_classification) AS classified;"
+
+     EXPECT: 4 | 4 | 96 | 0
+     96 = 24 + 24 + 12 + 36. classified is 0 because arrears-eod does not exist
+     until Phase 5 — nothing has written to that table yet.
+
+===============================================================================
+ PART B — ADD NEW DATA RECORDS
+===============================================================================
+ Phase 1 has no HTTP API, so records are added with SQL. From Phase 3 the same
+ result comes from: curl -X POST .../applications -d @demo/payloads/APP-100244.json
+
+B.1  Add a loan disbursed TODAY. This is the CURRENT-bucket case, and it is
+     exactly what APP-100244 will be during the real demo (§7.4).
+
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        INSERT INTO loan_applications (application_id, applicant_name, national_id,
+            wallet_msisdn, amount_kes, term_months, monthly_income, employment_months,
+            kyc_verified, existing_defaults, score, decision, decision_reason, decided_at)
+        VALUES ('APP-900001','Test User','99999999','254700000001',
+            250000.00, 24, 96000.00, 30, TRUE, 0, 712, 'APPROVED', 'manual test row', now());
+
+        INSERT INTO disbursements (disbursement_id, application_id, amount_kes,
+            wallet_msisdn, provider_ref, status)
+        VALUES ('DSB-900001','APP-900001',250000.00,'254700000001','PR-TEST-900001','SENT');
+
+        -- full 24-instalment schedule, first due one month after disbursement (§5)
+        INSERT INTO repayments (application_id, instalment_no, due_date, amount_due_kes)
+        SELECT 'APP-900001', n,
+               (CURRENT_DATE + (n || ' months')::interval)::date,
+               CASE WHEN n = 24 THEN 340000.00 - 14166.67*23 ELSE 14166.67 END
+        FROM generate_series(1,24) AS n;
+SQL
+
+     EXPECT: INSERT 0 1 / INSERT 0 1 / INSERT 0 24
+
+B.2  Verify the new loan classifies as CURRENT with nothing overdue.
+
+        psql -c "
+        SELECT application_id, COUNT(*) AS instalments,
+               SUM(amount_due_kes) AS total, MIN(due_date) AS first_due,
+               COALESCE(CURRENT_DATE - MIN(due_date)
+                          FILTER (WHERE paid_date IS NULL AND due_date < CURRENT_DATE), 0) AS dpd
+          FROM repayments WHERE application_id='APP-900001' GROUP BY 1;"
+
+     EXPECT: 24 instalments, total 340000.00, first_due one month from today,
+     dpd 0  -> bucket CURRENT.
+     Total matches APP-100244's 340,000 because amount and term are identical.
+
+B.3  Confirm it joins into the portfolio view — now five loans, five buckets.
+
+        Re-run the query from A.4.
+
+     EXPECT: the four seeded rows unchanged, plus
+       APP-900001  Test User     0  CURRENT  340000.00
+
+     This is the five-row / five-bucket shape §7.4 describes, with APP-900001
+     standing in for the APP-100244 that scenario 1 will create from Phase 3.
+
+B.4  Add a partial repayment and watch the DPD move. Back-date the first three
+     instalments so instalment 4 is 45 days overdue.
+
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        UPDATE repayments
+           SET due_date  = (CURRENT_DATE - 45 - ((4 - instalment_no) * 30))::date,
+               paid_date = (CURRENT_DATE - 45 - ((4 - instalment_no) * 30))::date
+         WHERE application_id='APP-900001' AND instalment_no < 4;
+        UPDATE repayments
+           SET due_date = (CURRENT_DATE - 45)::date
+         WHERE application_id='APP-900001' AND instalment_no = 4;
+SQL
+
+     Then re-run B.2's query.
+
+     EXPECT: dpd 45  -> bucket DPD_31_60.
+     This is the mechanism the seed uses, done by hand on one loan.
+
+B.5  Clean up — remove the test loan. Children first (all three tables
+     reference loan_applications).
+
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        DELETE FROM arrears_classification WHERE application_id='APP-900001';
+        DELETE FROM repayments            WHERE application_id='APP-900001';
+        DELETE FROM disbursements         WHERE application_id='APP-900001';
+        DELETE FROM loan_applications     WHERE application_id='APP-900001';
+SQL
+
+     Then confirm you are back to the seeded baseline:
+
+        Re-run A.8.   EXPECT: 4 | 4 | 96 | 0
+
+===============================================================================
+ PART C — NEGATIVE TESTS (the database must reject these)
+===============================================================================
+ Each is a single statement, so a failure changes nothing. No cleanup needed.
+
+C.1  Disbursement referencing a loan that does not exist.
+
+        psql -c "INSERT INTO disbursements
+                   (disbursement_id,application_id,amount_kes,wallet_msisdn,status)
+                 VALUES ('DSB-X','APP-DOESNOTEXIST',1000,'254700000000','SENT');"
+
+     EXPECT:
+       ERROR: insert or update on table "disbursements" violates foreign key
+              constraint "disbursements_application_id_fkey"
+       DETAIL: Key (application_id)=(APP-DOESNOTEXIST) is not present in
+               table "loan_applications".
+
+C.2  Duplicate application id.
+
+        psql -c "INSERT INTO loan_applications
+                   (application_id,applicant_name,national_id,wallet_msisdn,
+                    amount_kes,term_months,monthly_income,employment_months)
+                 VALUES ('APP-100301','Dup','1','254700000000',1000,12,5000,12);"
+
+     EXPECT:
+       ERROR: duplicate key value violates unique constraint
+              "loan_applications_pkey"
+       DETAIL: Key (application_id)=(APP-100301) already exists.
+
+     From Phase 3 this case is handled above the database instead: loan-api
+     returns 200 with the existing record and does not re-score (§7.1).
+
+C.3  Duplicate instalment number for the same loan.
+
+        psql -c "INSERT INTO repayments
+                   (application_id,instalment_no,due_date,amount_due_kes)
+                 VALUES ('APP-100301',1,CURRENT_DATE,100);"
+
+     EXPECT:
+       ERROR: duplicate key value violates unique constraint
+              "repayments_application_id_instalment_no_key"
+       DETAIL: Key (application_id, instalment_no)=(APP-100301, 1)
+               already exists.
+
+C.4  Confirm none of C.1-C.3 changed anything.
+
+        Re-run A.8.   EXPECT: 4 | 4 | 96 | 0
+
+===============================================================================
+ PART D — IDEMPOTENCY AND RESET
+===============================================================================
+
+D.1  Seeding twice must not duplicate rows.
+
+        make seed && make seed
+
+     Then re-run A.8.   EXPECT: 4 | 4 | 96 | 0  (unchanged)
+
+     seed.sql deletes its own APP-1003% rows before inserting, and migrations
+     are skipped once the schema exists.
+
+D.2  Full reset from nothing.
+
+        time make reset
+
+     `make reset` runs down (removing volumes), up, then seed.
+     EXPECT: ends with the four-row summary table and "migrate: done".
+     Note the elapsed time. Measured on this machine (M1 Pro, 6 CPU / 10 GiB
+     Colima) at Phase 1: 8 seconds, with images already pulled. §9.3 budgets
+     under two minutes for `make reset && make smoke`; smoke does not exist
+     until Phase 3, so 8s is the floor that measurement builds on.
+
+     Then re-run A.4 to confirm DPDs are 12 / 47 / 78 / 124 again — a reset
+     re-seeds, so the dates are freshly anchored to today.
+
+D.3  Tear down completely.
+
+        make down
+
+     EXPECT: containers and volumes removed. Re-running `make up && make seed`
+     returns to the A.* baseline from scratch.
+
+===============================================================================
+ QUICK REFERENCE — one-line health check
+===============================================================================
+ Run all of PART A's assertions at once and eyeball four rows plus the totals:
+
+   set -a && . ./.env && set +a && \
+   psql -c "SELECT l.application_id,
+                   (CURRENT_DATE - MIN(r.due_date) FILTER (WHERE r.paid_date IS NULL)) AS dpd,
+                   SUM(r.amount_due_kes) FILTER (WHERE r.paid_date IS NULL) AS outstanding
+              FROM loan_applications l JOIN repayments r USING (application_id)
+             GROUP BY 1 ORDER BY dpd DESC;" && \
+   psql -c "SELECT (SELECT COUNT(*) FROM loan_applications) AS loans,
+                   (SELECT COUNT(*) FROM repayments) AS repayments;"
+
+ Healthy Phase 1 state: DPD 124/78/47/12, loans 4, repayments 96.
+===============================================================================

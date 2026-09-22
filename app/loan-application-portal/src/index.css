@@ -1,0 +1,175 @@
+/* index.css — Kifaru Bank loan application portal.
+ *
+ * Same restraint as the loan officer console: navy and white, no gradients,
+ * generous whitespace. Sized for a projector — this is the screen the room looks
+ * at first, so the form controls are deliberately large.
+ */
+
+:root {
+  --navy: #0d2240;
+  --navy-light: #1b3a63;
+  --ink: #16202e;
+  --muted: #5b6b7f;
+  --line: #d8dee7;
+  --page: #ffffff;
+  --panel: #f6f8fa;
+  --approved: #1c6b3f;
+  --declined: #9b2226;
+  --pending: #8a6d1f;
+
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+  font-size: 18px;
+  color: var(--ink);
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); }
+
+.masthead {
+  background: var(--navy);
+  color: #fff;
+  padding: 1.1rem 2rem;
+}
+
+/* Logo + name + descriptor on one row. The mark inherits the masthead's white
+   via fill="currentColor", so there is no inverted asset to keep in sync. */
+.wordmark { display: flex; align-items: center; gap: 0.7rem; }
+.wordmark .name { font-size: 1.55rem; font-weight: 700; letter-spacing: 0.02em; }
+.wordmark .sub { font-weight: 300; opacity: 0.75; font-size: 1.05rem; }
+
+main { padding: 2.5rem 2rem 4rem; max-width: 720px; margin: 0 auto; }
+
+h1 { font-size: 1.9rem; margin: 0 0 0.4rem; font-weight: 650; }
+.subtitle { color: var(--muted); margin: 0 0 2.25rem; font-size: 1.05rem; }
+
+/* --- form ------------------------------------------------------------------ */
+
+fieldset {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1.5rem 1.75rem 1.75rem;
+  margin: 0 0 1.5rem;
+}
+
+legend {
+  padding: 0 0.6rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.field { display: block; margin-bottom: 1.35rem; }
+.field:last-child { margin-bottom: 0; }
+
+.field .label { display: block; font-weight: 600; margin-bottom: 0.4rem; font-size: 1rem; }
+
+.field input[type='text'],
+.field input:not([type]),
+.field select {
+  width: 100%;
+  font: inherit;
+  font-size: 1.05rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #fff;
+  color: var(--ink);
+}
+
+.field input:focus, .field select:focus {
+  outline: 2px solid var(--navy-light);
+  outline-offset: -1px;
+  border-color: var(--navy-light);
+}
+
+.field.invalid input, .field.invalid select { border-color: var(--declined); }
+
+.hint { display: block; margin-top: 0.35rem; color: var(--muted); font-size: 0.9rem; }
+.error { display: block; margin-top: 0.35rem; color: var(--declined); font-size: 0.9rem; font-weight: 500; }
+
+.check { display: flex; align-items: flex-start; gap: 0.7rem; margin-top: 1.35rem; cursor: pointer; }
+.check input { width: 1.15rem; height: 1.15rem; margin-top: 0.15rem; accent-color: var(--navy); }
+
+.estimate {
+  margin: 0.25rem 0 0;
+  padding: 0.85rem 1rem;
+  background: var(--panel);
+  border-left: 3px solid var(--navy-light);
+  font-size: 1rem;
+}
+.estimate span { color: var(--muted); }
+
+.advanced { margin-bottom: 1.75rem; }
+.advanced summary { cursor: pointer; color: var(--muted); font-size: 0.95rem; padding: 0.4rem 0; }
+.advanced .field { margin-top: 0.85rem; }
+
+.submit {
+  width: 100%;
+  background: var(--navy);
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 1.15rem;
+  font-weight: 600;
+  padding: 0.95rem;
+  cursor: pointer;
+}
+.submit:hover { background: var(--navy-light); }
+.submit:disabled { opacity: 0.6; cursor: default; }
+
+/* --- outcome ---------------------------------------------------------------- */
+
+.outcome {
+  border: 1px solid var(--line);
+  border-top: 5px solid var(--muted);
+  border-radius: 4px;
+  padding: 2rem 2.25rem 2.25rem;
+  margin-bottom: 1.75rem;
+}
+
+.outcome.approved { border-top-color: var(--approved); }
+.outcome.approved h1 { color: var(--approved); }
+.outcome.declined { border-top-color: var(--declined); }
+.outcome.declined h1 { color: var(--declined); }
+.outcome.pending  { border-top-color: var(--pending); }
+.outcome.pending h1 { color: var(--pending); }
+.outcome.error    { border-top-color: var(--declined); }
+
+.outcome h1 { font-size: 2.2rem; margin: 0 0 0.75rem; }
+.outcome .lede { font-size: 1.15rem; margin: 0 0 1.5rem; }
+.outcome .reference { color: var(--muted); margin: 0 0 1rem; }
+.outcome .reference strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+.duplicate-note {
+  background: #fdf8e8;
+  border-left: 3px solid var(--pending);
+  padding: 0.85rem 1rem;
+  margin: 0 0 1.5rem;
+  font-size: 1rem;
+}
+
+.outcome dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.6rem 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--line);
+}
+.outcome dt { color: var(--muted); }
+.outcome dd { margin: 0; font-weight: 600; }
+
+.footnote { margin: 1.5rem 0 0; color: var(--muted); font-size: 0.95rem; }
+
+.link {
+  background: none;
+  border: none;
+  color: var(--navy-light);
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+}

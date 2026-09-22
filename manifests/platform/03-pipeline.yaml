@@ -1,0 +1,25 @@
+# P3 — the promotion path.
+#
+# A developer cannot promote development -> production. Not because of a rule in
+# a wiki: the path does not exist, so `occ component deploy --to production`
+# from development has nowhere to go.
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: DeploymentPipeline
+metadata:
+  name: default
+  namespace: kifaru-bank
+spec:
+  promotionPaths:
+    - sourceEnvironmentRef:
+        kind: Environment
+        name: development
+      targetEnvironmentRefs:
+        - kind: Environment
+          name: staging
+    - sourceEnvironmentRef:
+        kind: Environment
+        name: staging
+      targetEnvironmentRefs:
+        - kind: Environment
+          name: production

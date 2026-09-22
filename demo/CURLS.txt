@@ -1,0 +1,307 @@
+===============================================================================
+ KIFARU BANK — CURL REFERENCE
+ Every command copy-pasteable. Run from anywhere; paths are relative to
+ <repo>/tutorial-1
+===============================================================================
+
+ PORTS
+   8080   loan-api            the public front door (§7.1)
+   8081   credit-scoring      internal risk engine (§7.2) — no public route in prod
+   8082   payment-rail-stub   fake mobile money provider (§7.6)
+   9090   disbursement-worker ADMIN only: probes + metrics. Not a service endpoint.
+
+ Prerequisite:  make up      (all seven containers healthy)
+
+
+===============================================================================
+ 1. loan-api  —  http://localhost:8080
+===============================================================================
+
+--- submit an application (the main flow) -------------------------------------
+# 201 on first submit, 200 on a duplicate.
+
+curl -s -X POST localhost:8080/applications \
+     -H 'Content-Type: application/json' \
+     -d @demo/payloads/APP-100244.json | jq .
+
+# -> score 712, decision APPROVED
+# Watch the status code too:
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8080/applications \
+     -H 'Content-Type: application/json' -d @demo/payloads/APP-100244.json
+
+
+--- the declined fixture ------------------------------------------------------
+curl -s -X POST localhost:8080/applications \
+     -H 'Content-Type: application/json' \
+     -d @demo/payloads/APP-100245.json | jq -c '{score,decision,reason}'
+
+# -> score 480, decision DECLINED
+
+
+--- submit an inline application (no payload file) ----------------------------
+curl -s -X POST localhost:8080/applications \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "application_id": "APP-500001",
+       "applicant_name": "Test User",
+       "national_id": "12345678",
+       "wallet_msisdn": "254712345678",
+       "amount_kes": 250000,
+       "term_months": 24,
+       "monthly_income": 96000,
+       "employment_months": 30,
+       "kyc_verified": true,
+       "existing_defaults": 0
+     }' | jq .
+
+
+--- omit application_id and one is generated ----------------------------------
+curl -s -X POST localhost:8080/applications \
+     -H 'Content-Type: application/json' \
+     -d '{"applicant_name":"Auto Id","national_id":"99999999",
+          "wallet_msisdn":"254711111111","amount_kes":50000,"term_months":12,
+          "monthly_income":40000,"employment_months":12,"kyc_verified":true}' \
+     | jq -c '{application_id,score,decision}'
+
+# -> application_id like APP-229156
+
+
+--- fetch one, with disbursement and arrears bucket ---------------------------
+curl -s localhost:8080/applications/APP-100244 | jq .
+
+# Just the interesting parts:
+curl -s localhost:8080/applications/APP-100244 \
+  | jq -c '{score, decision,
+            provider_ref: .disbursement.provider_ref,
+            instalments: (.repayments|length),
+            arrears_bucket}'
+
+# -> {"score":712,"decision":"APPROVED","provider_ref":"PR-...","instalments":24,
+#     "arrears_bucket":null}
+# arrears_bucket stays null until arrears-eod runs (phase 5).
+
+
+--- the repayment schedule ----------------------------------------------------
+curl -s localhost:8080/applications/APP-100244 \
+  | jq -r '.repayments[] | "\(.instalment_no)\t\(.due_date)\t\(.amount_due_kes)"' | head
+
+# Total must be 340,000.00 for a 250k / 24-month loan (flat 18%).
+# Round the sum: jq adds in binary floating point and prints 339999.99999999994.
+# The stored data is exact — the worker computes in integer cents and the column
+# is NUMERIC(12,2). Confirm with psql if in doubt (shown below).
+curl -s localhost:8080/applications/APP-100244 \
+  | jq -r '[.repayments[].amount_due_kes] | add | .*100 | round / 100'
+# -> 340000
+
+# the authoritative check, straight from the database:
+#   psql -tAc "SELECT SUM(amount_due_kes) FROM repayments WHERE application_id='APP-100244';"
+#   -> 340000.00
+
+
+--- unknown id is a 404 -------------------------------------------------------
+curl -s -w '\nHTTP %{http_code}\n' localhost:8080/applications/APP-NOPE
+
+
+--- list, newest first --------------------------------------------------------
+curl -s 'localhost:8080/applications?limit=10' \
+  | jq -c '.[] | {application_id,applicant_name,score,decision,arrears_bucket}'
+
+
+--- filter by arrears bucket --------------------------------------------------
+# Returns [] until phase 5 populates arrears_classification. Not a bug.
+curl -s 'localhost:8080/applications?bucket=NPL_90_PLUS' | jq .
+
+
+--- health and readiness ------------------------------------------------------
+curl -s localhost:8080/healthz     # {"status":"ok"}      liveness, no dep checks
+curl -s localhost:8080/readyz      # {"status":"ready"}   checks database + NATS
+
+
+--- validation errors (400) ---------------------------------------------------
+# All failures reported together, not just the first (§7.1).
+curl -s -X POST localhost:8080/applications \
+     -H 'Content-Type: application/json' \
+     -d '{"applicant_name":"","national_id":"","wallet_msisdn":"0712345678",
+          "amount_kes":100,"term_months":7,"monthly_income":0,
+          "employment_months":-1,"kyc_verified":false}' | jq .
+
+# The rules:
+#   amount_kes         10,000 - 2,000,000 inclusive
+#   term_months        one of 6, 12, 24, 36
+#   monthly_income     > 0
+#   wallet_msisdn      ^254[17]\d{8}$   (third digit must be 1 or 7)
+#   applicant_name     non-empty
+#   national_id        non-empty
+
+
+--- with a trace header -------------------------------------------------------
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8080/applications \
+     -H 'Content-Type: application/json' \
+     -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+     -d @demo/payloads/APP-100244.json
+
+
+===============================================================================
+ 2. credit-scoring  —  http://localhost:8081
+===============================================================================
+ Internal-only in production. Reachable here only because compose publishes the
+ port for local testing.
+
+--- score directly (bypassing loan-api) ---------------------------------------
+curl -s -X POST localhost:8081/score \
+     -H 'Content-Type: application/json' \
+     -d @demo/payloads/APP-100244.json | jq .
+
+# -> 712 APPROVED, with the five-factor breakdown
+
+
+--- the scoring rules, live ---------------------------------------------------
+curl -s localhost:8081/rules | jq .
+
+# -> approval_threshold 650, annual_flat_rate 0.18, the four DTI bands
+
+
+--- move one rule at a time ---------------------------------------------------
+# Handy helper:
+score() { curl -s -X POST localhost:8081/score \
+            -H 'Content-Type: application/json' -d "$1" | jq -c '{score,decision}'; }
+
+# baseline                                         -> 712 APPROVED
+score '{"application_id":"T","amount_kes":250000,"term_months":24,"monthly_income":96000,"employment_months":30,"kyc_verified":true,"existing_defaults":0}'
+
+# KYC false: +40 becomes -80, a 120-point swing    -> 592 DECLINED
+score '{"application_id":"T","amount_kes":250000,"term_months":24,"monthly_income":96000,"employment_months":30,"kyc_verified":false,"existing_defaults":0}'
+
+# one prior default: -150                          -> 562 DECLINED
+score '{"application_id":"T","amount_kes":250000,"term_months":24,"monthly_income":96000,"employment_months":30,"kyc_verified":true,"existing_defaults":1}'
+
+# unaffordable, DTI 0.82                           -> 384 DECLINED
+score '{"application_id":"T","amount_kes":500000,"term_months":12,"monthly_income":60000,"employment_months":24,"kyc_verified":true,"existing_defaults":0}'
+
+# five defaults, clamped at the floor              -> 300 DECLINED
+score '{"application_id":"T","amount_kes":300000,"term_months":24,"monthly_income":38000,"employment_months":24,"kyc_verified":true,"existing_defaults":5}'
+
+
+--- health --------------------------------------------------------------------
+curl -s localhost:8081/healthz
+curl -s localhost:8081/readyz
+# NOTE: /metrics is NOT on 8081 — Ballerina's built-in Prometheus endpoint lives
+# on the runtime observability port. Known deviation from §7.2.
+
+
+===============================================================================
+ 3. payment-rail-stub  —  http://localhost:8082
+===============================================================================
+ The worker calls this. You normally would not, but it is useful for showing the
+ provider's own idempotency.
+
+--- first payment: 201 with a new provider_ref --------------------------------
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8082/v1/payments \
+     -H 'Content-Type: application/json' \
+     -H 'Idempotency-Key: DEMO-KEY-1' \
+     -d '{"application_id":"APP-100244","amount_kes":250000,"wallet_msisdn":"254712345678"}'
+
+
+--- same key again: 200, SAME ref, duplicate:true ------------------------------
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8082/v1/payments \
+     -H 'Content-Type: application/json' \
+     -H 'Idempotency-Key: DEMO-KEY-1' \
+     -d '{"application_id":"APP-100244","amount_kes":250000,"wallet_msisdn":"254712345678"}'
+
+
+--- missing Idempotency-Key is rejected ---------------------------------------
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8082/v1/payments \
+     -H 'Content-Type: application/json' -d '{"application_id":"X"}'
+# -> 400
+
+curl -s localhost:8082/healthz
+
+
+===============================================================================
+ 4. disbursement-worker  —  http://localhost:9090  (ADMIN ONLY)
+===============================================================================
+ There is deliberately no service endpoint: it is a consumer, not a server. This
+ port exists so the platform can probe and scrape it (§7.3).
+
+curl -s localhost:9090/healthz     # {"status":"ok"}
+curl -s localhost:9090/readyz      # checks valkey + database
+
+--- the metric scenario 2 asserts on -------------------------------------------
+curl -s localhost:9090/metrics | grep -E '^disbursement'
+
+# disbursements_total              successfully sent
+# disbursements_suppressed_total   blocked by the Valkey claim  <-- the important one
+# disbursement_failures_total      abandoned after retries
+# disbursement_retries_total       failed attempts rescheduled
+
+# Just the suppression counter:
+curl -s localhost:9090/metrics | awk '/^disbursements_suppressed_total /{print $2}'
+
+
+===============================================================================
+ 5. END-TO-END: watch a loan flow all the way through
+===============================================================================
+
+# 1. clean slate for this one loan — BOTH the rows and the Valkey claim.
+#    The claim has a 7-day TTL, so skipping it makes the next run suppress its
+#    own legitimate disbursement and look like a broken worker.
+set -a && . ./.env && set +a
+psql -q -c "DELETE FROM repayments WHERE application_id='APP-100244';
+            DELETE FROM disbursements WHERE application_id='APP-100244';
+            DELETE FROM loan_applications WHERE application_id='APP-100244';"
+docker compose exec -T valkey valkey-cli DEL disb:APP-100244
+
+# 2. submit                                        -> 201, score 712
+curl -s -o /dev/null -w 'submit HTTP %{http_code}\n' -X POST localhost:8080/applications \
+     -H 'Content-Type: application/json' -d @demo/payloads/APP-100244.json
+
+# 3. the worker disburses asynchronously — give it a moment, then look
+sleep 3
+curl -s localhost:8080/applications/APP-100244 \
+  | jq -c '{decision, provider_ref:.disbursement.provider_ref,
+            status:.disbursement.status, instalments:(.repayments|length)}'
+# -> APPROVED, PR-..., SENT, 24
+
+# 4. what the worker logged
+docker compose logs disbursement-worker | grep -E 'claimed|payment sent|complete' | tail -3
+
+# 5. resubmit — 200, and still exactly ONE disbursement
+curl -s -o /dev/null -w 'resubmit HTTP %{http_code}\n' -X POST localhost:8080/applications \
+     -H 'Content-Type: application/json' -d @demo/payloads/APP-100244.json
+psql -tAc "SELECT count(*) FROM disbursements WHERE application_id='APP-100244';"
+# -> 1
+
+
+===============================================================================
+ 6. THE EVENT STREAM
+===============================================================================
+
+# message count and subjects
+docker run --rm --network kifaru_default natsio/nats-box:latest \
+  nats --server nats:4222 stream info LOANS | grep -iE 'messages|subjects'
+
+docker run --rm --network kifaru_default natsio/nats-box:latest \
+  nats --server nats:4222 stream subjects LOANS
+
+# read one message body (traceparent rides in the PAYLOAD, not a NATS header —
+# ballerinax/nats has no header API; known deviation from §8)
+docker run --rm --network kifaru_default natsio/nats-box:latest \
+  nats --server nats:4222 stream get LOANS 1
+
+# purge accumulated test events
+docker run --rm --network kifaru_default natsio/nats-box:latest \
+  nats --server nats:4222 stream purge LOANS --force
+
+
+===============================================================================
+ TROUBLESHOOTING
+===============================================================================
+
+ Connection refused on any port      -> make up            (check `docker compose ps`)
+ psql: authentication failed          -> set -a && . ./.env && set +a
+ make: No rule to make target         -> cd to tutorial-1; that is where the Makefile is
+ disbursement never appears           -> stale Valkey claim. See section 5 step 1.
+ arrears_bucket always null           -> correct until phase 5 (arrears-eod)
+ /metrics 404 on 8080 or 8081         -> known deviation; Ballerina serves those on its
+                                         own observability port, not the service port
+===============================================================================

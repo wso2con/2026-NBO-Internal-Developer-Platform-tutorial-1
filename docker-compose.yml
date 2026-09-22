@@ -1,0 +1,343 @@
+# docker-compose.yml — Kifaru Bank retail lending demo
+#
+# Compose v2 plugin syntax, no `version:` key (BUILD-SPEC.md §9.2).
+# Startup is sequenced with healthchecks and `depends_on: condition: service_healthy`,
+# never with sleeps.
+#
+# PHASE 1 scope: postgres, nats, valkey and the migrate helper only (§12).
+# The five application services plus payment-rail-stub are added in phases 2-6, at the
+# marker near the bottom of this file. Host ports are reserved for them in §9.2:
+#   loan-api 8080 · credit-scoring 8081 · payment-rail 8082 · console 3000 · worker admin 9090
+
+name: kifaru
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  nats:
+    # -alpine variant: the distroless nats image has no shell, so it cannot express a
+    # healthcheck. -m 8222 exposes the monitoring endpoint that healthcheck probes.
+    image: nats:2.10-alpine
+    restart: unless-stopped
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 3s
+
+  valkey:
+    image: valkey/valkey:8
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 2s
+
+  # Applies db/migrations/*.sql then db/seed/seed.sql (§3.4 — plain SQL, no framework).
+  # Profile `tools` keeps it out of `make up`; `make seed` runs it explicitly.
+  migrate:
+    image: postgres:16
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+    volumes:
+      - ./db:/db:ro
+    entrypoint: ["/bin/bash", "/db/apply.sh"]
+
+  # ---------------------------------------------------------------------------
+  # Optional tracing stack — `docker compose --profile observability up -d` (§9.2).
+  # Off by default so the normal loop stays fast.
+  # ---------------------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:16686/ >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # --- phase 2 ---------------------------------------------------------------
+  # Internal-only risk engine (§7.2). Stateless: no database, no outbound calls,
+  # so it has no depends_on. The host port mapping exists for local testing only —
+  # on OpenChoreo this service gets no public route, ever.
+  credit-scoring:
+    build:
+      context: ./app/credit-scoring
+    image: kifaru/credit-scoring:local
+    restart: unless-stopped
+    environment:
+      # §7.2 service-specific default; §2.4's general 8080 does not apply here.
+      PORT: "8081"
+      LOG_LEVEL: ${LOG_LEVEL}
+      # Makes ballerina/log emit JSON (§2.5) without a Config.toml (§3.2).
+      BAL_CONFIG_VAR_BALLERINA_LOG_FORMAT: json
+    ports:
+      - "8081:8081"
+    # §2.3 / §11 — the same posture `make verify-hardened` and Act 4 assert.
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # healthcheck comes from the image's HEALTHCHECK instruction
+
+  # --- phase 3 ---------------------------------------------------------------
+  # Creates the LOANS JetStream stream (§8) and exits. Runs once per `make up`;
+  # `stream add` is idempotent, so a re-run on an existing stream is a no-op.
+  nats-init:
+    image: natsio/nats-box:latest
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: "no"
+    # Kept on one line deliberately: a YAML folded scalar preserves newlines for
+    # more-indented continuation lines, which silently splits the command.
+    entrypoint:
+      - sh
+      - -c
+      - "nats --server nats:4222 stream info LOANS >/dev/null 2>&1 && echo 'nats-init: stream LOANS already exists' || nats --server nats:4222 stream add LOANS --defaults --subjects 'loan.>' --storage file --retention limits --max-age 24h"
+
+  # The fake external payment provider (§7.6). Nothing calls it until phase 4;
+  # it is here so the worker has a target ready.
+  payment-rail-stub:
+    build:
+      context: ./app/payment-rail-stub
+    image: kifaru/payment-rail-stub:local
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL}
+      FAIL_RATE: ${FAIL_RATE}
+      LATENCY_MS: ${LATENCY_MS}
+    ports:
+      - "8082:8080"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # The front door (§7.1). The only component built from source live on stage.
+  loan-api:
+    build:
+      context: ./app/loan-api
+    image: kifaru/loan-api:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      credit-scoring:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+    environment:
+      PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL}
+      # Injected by the platform in the OpenChoreo phase; by compose here (§7.1).
+      DATABASE_URL: ${DATABASE_URL}
+      NATS_URL: ${NATS_URL}
+      CREDIT_SCORING_URL: ${CREDIT_SCORING_URL}
+      SCORING_TIMEOUT_MS: ${SCORING_TIMEOUT_MS}
+      BAL_CONFIG_VAR_BALLERINA_LOG_FORMAT: json
+    ports:
+      - "8080:8080"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # --- phase 4 ---------------------------------------------------------------
+  # The money mover (§7.3). A JetStream consumer, NOT a service: it declares no
+  # service endpoint, so the only port published is the admin one carrying
+  # /healthz, /readyz and /metrics.
+  disbursement-worker:
+    build:
+      context: ./app/disbursement-worker
+    image: kifaru/disbursement-worker:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      payment-rail-stub:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+      # All injected by the platform in the OpenChoreo phase (§7.3).
+      NATS_URL: ${NATS_URL}
+      VALKEY_URL: ${VALKEY_URL}
+      DATABASE_URL: ${DATABASE_URL}
+      PAYMENT_RAIL_URL: ${PAYMENT_RAIL_URL}
+      PAYMENT_RAIL_API_KEY: ${PAYMENT_RAIL_API_KEY}
+      IDEMPOTENCY_TTL_HOURS: ${IDEMPOTENCY_TTL_HOURS}
+      ADMIN_PORT: "9090"
+    ports:
+      # Admin only — probes and metrics. Not a service endpoint (§9.2).
+      - "9090:9090"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # --- phase 5 ---------------------------------------------------------------
+  # The night shift (§7.4). A BATCH JOB, not a service: it runs to completion and
+  # exits, and the platform will schedule it as a CronJob. Profile `tools` keeps
+  # it out of `make up`; run it explicitly:
+  #
+  #     docker compose run --rm arrears-eod
+  #     docker compose run --rm -e AS_OF_DATE=2026-12-01 arrears-eod   # fast-forward
+  #     docker compose run --rm -e DRY_RUN=true arrears-eod            # no writes
+  arrears-eod:
+    build:
+      context: ./app/arrears-eod
+    image: kifaru/arrears-eod:local
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+      DATABASE_URL: ${DATABASE_URL}
+      # AS_OF_DATE deliberately unset — defaults to today (§7.4, §10.6).
+      DRY_RUN: ${DRY_RUN:-false}
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # --- customer portal ---------------------------------------------------------
+  # The applicant's front door. Not in BUILD-SPEC.md's original component list —
+  # added so the demo narrative's first beat ("a customer applies for a loan", §1)
+  # is a person filling in a form rather than a curl command. Stands in for the
+  # mobile app: a browser tab has fewer ways to fail on stage than an emulator.
+  #
+  # Submission only. It reads nothing back — no arrears, no schedules, no other
+  # applications. That is the loan officer console's job, and a customer-facing
+  # app that could read collections data would be the wrong shape.
+  loan-application-portal:
+    build:
+      context: ./app/loan-application-portal
+    image: kifaru/loan-application-portal:local
+    restart: unless-stopped
+    depends_on:
+      loan-api:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL}
+      # As seen from the USER'S browser, not from inside the compose network.
+      API_BASE_URL: ${API_BASE_URL}
+    ports:
+      - "3001:8080"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # --- phase 6 ---------------------------------------------------------------
+  # The staff screen (§7.5). The bundle is environment-agnostic: API_BASE_URL is
+  # read at RUNTIME from /config.js, which the container generates per request.
+  # Change the variable, restart the container, done — no rebuild.
+  loan-officer-console:
+    build:
+      context: ./app/loan-officer-console
+    image: kifaru/loan-officer-console:local
+    restart: unless-stopped
+    depends_on:
+      loan-api:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL}
+      # The browser calls loan-api directly, so this is the address as seen from
+      # the USER'S machine, not from inside the compose network.
+      API_BASE_URL: ${API_BASE_URL}
+    ports:
+      - "3000:8080"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres-data:
+  nats-data:
+  valkey-data:

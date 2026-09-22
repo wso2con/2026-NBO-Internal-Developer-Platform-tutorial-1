@@ -1,0 +1,31 @@
+# P8 — authorization.
+#
+# Bindings map a JWT CLAIM to a role. They are not per-user, so onboarding is
+# entirely IdP-side: put a user in the group and the platform grants the role
+# with no change here.
+#
+# The shipped developer-binding maps groups=developers with scope {} (cluster
+# wide) to the shipped developer role, which cannot create projects. This one is
+# narrower AND different: the bank's developers get the bank's OWN role
+# (13-authzrole-kifaru-developer.yaml: shipped developer + project create/update/
+# delete) ONLY inside kifaru-bank. A developer from another tenant on the same
+# cluster has no access here at all.
+#
+# ClusterAuthzRoleBinding is cluster-scoped, so its name carries the namespace.
+# The IdP side — a user in the kifaru-bank-developers group — is P8b in the guide.
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ClusterAuthzRoleBinding
+metadata:
+  name: kifaru-bank-developers-binding
+spec:
+  effect: allow
+  entitlement:
+    claim: groups
+    value: kifaru-bank-developers
+  roleMappings:
+    - roleRef:
+        kind: ClusterAuthzRole
+        name: kifaru-developer
+      scope:
+        namespace: kifaru-bank

@@ -1,0 +1,14 @@
+[package]
+org = "kifaru"
+name = "credit_scoring"
+version = "0.1.0"
+distribution = "2201.13.6"
+
+# Observability uses Ballerina's built-in OpenTelemetry tracing and Prometheus metrics,
+# enabled via the build/run observability flags — no extra libraries (BUILD-SPEC.md §3.2).
+#
+# NOTE: configuration is read with os:getEnv() only. There is deliberately no Config.toml
+# in this package and no `configurable` variable anywhere (§3.2, §14).
+
+[build-options]
+observabilityIncluded = true

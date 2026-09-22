@@ -1,0 +1,242 @@
+# P5a — internal-engine
+#
+# DERIVED FROM the shipped ClusterComponentType/service, with three changes:
+#   1. the httproute-external resource is REMOVED  (7 resources remain, not 8)
+#   2. allowedWorkflows narrowed to ballerina-buildpack-builder + dockerfile-builder
+#      (two of the four shipped builders are blocked. credit-scoring is Ballerina;
+#      payment-rail-stub is Go and also lives inside the cell, so both need a home
+#      here. Nobody gets paketo or gcp buildpacks on an internal engine.)
+#   3. validations replaced with the bank's rules
+#
+# Regenerate the base at any time with:  occ clustercomponenttype get service
+# Developers reference this as:          deployment/internal-engine
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ComponentType
+metadata:
+  name: internal-engine
+  namespace: kifaru-bank
+  annotations:
+    openchoreo.dev/display-name: Kifaru Internal Engine
+    openchoreo.dev/description: A request-serving component reachable only from inside
+      its own cell. For risk, scoring and other internal decisioning services.
+spec:
+  allowedTraits:
+  - kind: ClusterTrait
+    name: observability-alert-rule
+  allowedWorkflows:
+  - kind: ClusterWorkflow
+    name: ballerina-buildpack-builder
+  - kind: ClusterWorkflow
+    name: dockerfile-builder
+  environmentConfigs:
+    openAPIV3Schema:
+      "$defs":
+        ResourceQuantity:
+          default: {}
+          properties:
+            cpu:
+              default: 100m
+              type: string
+            memory:
+              default: 256Mi
+              type: string
+          type: object
+        ResourceRequirements:
+          default: {}
+          properties:
+            limits:
+              "$ref": "#/$defs/ResourceQuantity"
+            requests:
+              "$ref": "#/$defs/ResourceQuantity"
+          type: object
+      properties:
+        imagePullPolicy:
+          default: IfNotPresent
+          enum:
+          - Always
+          - IfNotPresent
+          - Never
+          type: string
+        replicas:
+          default: 1
+          minimum: 0
+          type: integer
+        resources:
+          "$ref": "#/$defs/ResourceRequirements"
+      type: object
+  resources:
+  - id: deployment
+    targetPlane: dataplane
+    template:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        labels: "${metadata.labels}"
+        name: "${metadata.name}"
+        namespace: "${metadata.namespace}"
+      spec:
+        replicas: "${environmentConfigs.replicas}"
+        selector:
+          matchLabels: "${metadata.podSelectors}"
+        template:
+          metadata:
+            labels: "${metadata.podSelectors}"
+          spec:
+            containers:
+            - args: "${has(workload.container.args) ? workload.container.args : oc_omit()}\n"
+              command: "${has(workload.container.command) ? workload.container.command
+                : oc_omit()}\n"
+              env: "${dependencies.toContainerEnvs()}"
+              envFrom: "${configurations.toContainerEnvFrom()}"
+              image: "${workload.container.image}"
+              imagePullPolicy: "${environmentConfigs.imagePullPolicy}"
+              name: main
+              resources:
+                limits:
+                  cpu: "${environmentConfigs.resources.limits.cpu}"
+                  memory: "${environmentConfigs.resources.limits.memory}"
+                requests:
+                  cpu: "${environmentConfigs.resources.requests.cpu}"
+                  memory: "${environmentConfigs.resources.requests.memory}"
+              volumeMounts: "${configurations.toContainerVolumeMounts() + dependencies.toContainerVolumeMounts()}"
+            volumes: "${configurations.toVolumes() + dependencies.toVolumes()}"
+  - id: service
+    includeWhen: "${size(workload.endpoints) > 0}"
+    targetPlane: dataplane
+    template:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        labels: "${metadata.labels}"
+        name: "${metadata.componentName}"
+        namespace: "${metadata.namespace}"
+      spec:
+        ports: "${workload.toServicePorts()}"
+        selector: "${metadata.podSelectors}"
+        type: ClusterIP
+  - forEach: ${workload.endpoints.transformMap(name, ep, "internal" in ep.visibility
+      && ep.type in ["HTTP", "GraphQL", "Websocket"], ep)}
+    id: httproute-internal
+    targetPlane: dataplane
+    template:
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: HTTPRoute
+      metadata:
+        labels: '${oc_merge(metadata.labels, {"openchoreo.dev/endpoint-name": endpoint.key,
+          "openchoreo.dev/endpoint-visibility": "internal"})}'
+        name: ${oc_generate_name(metadata.componentName, endpoint.key, "internal")}
+        namespace: "${metadata.namespace}"
+      spec:
+        hostnames: |
+          ${[gateway.ingress.internal.?http, gateway.ingress.internal.?https]
+            .filter(g, g.hasValue()).map(g, g.value().host).distinct()
+            .map(h, metadata.environmentName + "-" + metadata.componentNamespace + "." + h)}
+        parentRefs:
+        - name: "${gateway.ingress.internal.name}"
+          namespace: "${gateway.ingress.internal.namespace}"
+        rules:
+        - backendRefs:
+          - name: "${metadata.componentName}"
+            port: "${endpoint.value.port}"
+          filters:
+          - type: URLRewrite
+            urlRewrite:
+              path:
+                replacePrefixMatch: ${endpoint.value.?basePath.orValue("/")}
+                type: ReplacePrefixMatch
+          matches:
+          - path:
+              type: PathPrefix
+              value: "/${metadata.componentName}-${endpoint.key}"
+    var: endpoint
+  - forEach: "${configurations.toConfigEnvsByContainer()}"
+    id: env-config
+    targetPlane: dataplane
+    template:
+      apiVersion: v1
+      data: "${envConfig.envs.transformMapEntry(index, env, {env.name: env.value})}\n"
+      kind: ConfigMap
+      metadata:
+        name: "${envConfig.resourceName}"
+        namespace: "${metadata.namespace}"
+    var: envConfig
+  - forEach: "${configurations.toConfigFileList()}"
+    id: file-config
+    targetPlane: dataplane
+    template:
+      apiVersion: v1
+      data:
+        "${config.name}": "${config.value}\n"
+      kind: ConfigMap
+      metadata:
+        name: "${config.resourceName}"
+        namespace: "${metadata.namespace}"
+    var: config
+  - forEach: "${configurations.toSecretEnvsByContainer()}"
+    id: secret-env-external
+    targetPlane: dataplane
+    template:
+      apiVersion: external-secrets.io/v1
+      kind: ExternalSecret
+      metadata:
+        name: "${secretEnv.resourceName}"
+        namespace: "${metadata.namespace}"
+      spec:
+        data: |
+          ${secretEnv.envs.map(secret, {
+            "secretKey": secret.name,
+            "remoteRef": {
+              "key": secret.remoteRef.key,
+              ?"property": secret.remoteRef.?property
+            }
+          })}
+        refreshInterval: 15s
+        secretStoreRef:
+          kind: ClusterSecretStore
+          name: "${dataplane.secretStore}"
+        target:
+          creationPolicy: Owner
+          name: "${secretEnv.resourceName}"
+    var: secretEnv
+  - forEach: "${configurations.toSecretFileList()}"
+    id: secret-file-external
+    targetPlane: dataplane
+    template:
+      apiVersion: external-secrets.io/v1
+      kind: ExternalSecret
+      metadata:
+        name: "${file.resourceName}"
+        namespace: "${metadata.namespace}"
+      spec:
+        data:
+        - remoteRef:
+            key: "${file.remoteRef.key}"
+            property: "${has(file.remoteRef.property) ? file.remoteRef.property :
+              oc_omit()}\n"
+          secretKey: "${file.name}"
+        refreshInterval: 15s
+        secretStoreRef:
+          kind: ClusterSecretStore
+          name: "${dataplane.secretStore}"
+        target:
+          creationPolicy: Owner
+          name: "${file.resourceName}"
+    var: file
+  validations:
+  - rule: ${!workload.endpoints.exists(name, ep, "external" in ep.visibility)}
+    message: Internal engines must not expose external endpoints. Risk and scoring
+      services are reachable only from inside the cell.
+  - rule: "${size(workload.endpoints) > 0}"
+    message: An internal engine must expose at least one project-visible endpoint.
+  - message: Endpoints with 'internal' visibility require gateway.ingress.internal
+      to be configured on the Environment or DataPlane.
+    rule: |-
+      ${workload.endpoints.exists(name, ep, "internal" in ep.visibility)
+        ? has(gateway.ingress) && has(gateway.ingress.internal)
+        : true}
+  - rule: ${metadata.environmentName != "production" || environmentConfigs.replicas
+      >= 2}
+    message: Production requires at least two replicas. Single-replica workloads are
+      not permitted in a production environment.
+  workloadType: deployment

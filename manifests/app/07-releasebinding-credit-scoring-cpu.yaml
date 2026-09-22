@@ -1,0 +1,37 @@
+# D7 (recommended before a demo) — give credit-scoring a real CPU budget.
+#
+# Every component type defaults to resources.limits.cpu 100m. credit-scoring is a
+# JVM (Ballerina): throttled to a tenth of a core its cold start is ~20 s and the
+# first /score calls take 2-5 s, while loan-api-go allows 2 s (SCORING_TIMEOUT_MS)
+# and answers 503 "scoring service unavailable" when late. Observed: first two
+# submissions 503, third 201; at 500m the first submission on a fresh pod is 201.
+#
+# The limit is an environmentConfig, so the DEVELOPER sets it per environment on
+# the binding — no ComponentType change, no platform engineer. releaseName must
+# be the binding's CURRENT release:
+#
+#   occ releasebinding get credit-scoring-development -n kifaru-bank | grep releaseName
+#
+# Applying this re-renders the Deployment with the new resources and rolls the
+# pod. Once it is back, POST one application to warm the JIT before the demo.
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ReleaseBinding
+metadata:
+  name: credit-scoring-development
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+    componentName: credit-scoring
+  environment: development
+  releaseName: REPLACE_WITH_CURRENT_RELEASE
+  state: Active
+  componentTypeEnvironmentConfigs:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi

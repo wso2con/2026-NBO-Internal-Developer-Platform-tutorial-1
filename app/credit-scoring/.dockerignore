@@ -1,0 +1,5 @@
+# Build output must never be copied into the image — it would shadow the
+# builder stage's own compilation.
+target/
+Dependencies.toml
+.DS_Store

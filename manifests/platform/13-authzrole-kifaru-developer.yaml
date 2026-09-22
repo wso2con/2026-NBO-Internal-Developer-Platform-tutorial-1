@@ -1,0 +1,93 @@
+# P8 — the bank's developer role.
+#
+# DERIVED FROM the shipped ClusterAuthzRole/developer (occ clusterauthzrole get
+# developer), with three verbs added: project:create, project:update,
+# project:delete. In OpenChoreo's default model a Project — and the cell it gets —
+# is a platform-engineer object; the shipped developer can only VIEW projects.
+# This bank decided its developers create their own projects inside their
+# namespace, so the role says so. A role is a list of verbs; nothing else.
+#
+# Everything else is the shipped list, unchanged: a developer still cannot touch
+# environments, pipelines, types, or the planes. Compare:
+#   occ clusterauthzrole get developer
+#   occ clusterauthzrole get kifaru-developer
+#
+# ClusterAuthzRole is cluster-scoped by nature. The role is shared by every
+# namespace that binds to it (14-authzrolebinding-kifaru-developers.yaml scopes
+# the binding, not the role).
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ClusterAuthzRole
+metadata:
+  name: kifaru-developer
+spec:
+  description: Kifaru Bank developer — the shipped developer role plus the right to create, update and delete projects in the namespace the binding grants.
+  actions:
+    - clusterdataplane:view
+    - clusterworkflowplane:view
+    - clusterobservabilityplane:view
+    - clustercomponenttype:view
+    - clusterresourcetype:view
+    - clusterprojecttype:view
+    - clustertrait:view
+    - clusterworkflow:view
+    - namespace:view
+    - environment:view
+    - deploymentpipeline:view
+    - dataplane:view
+    - workflowplane:view
+    - observabilityplane:view
+    - componenttype:view
+    - resourcetype:view
+    - projecttype:view
+    - trait:view
+    - workflow:view
+    - project:view
+    - project:create
+    - project:update
+    - project:delete
+    - component:view
+    - component:create
+    - component:update
+    - component:delete
+    - component:exec
+    - componentrelease:view
+    - componentrelease:create
+    - releasebinding:view
+    - releasebinding:create
+    - releasebinding:update
+    - resource:view
+    - resource:create
+    - resource:update
+    - resource:delete
+    - resourcerelease:view
+    - resourcerelease:create
+    - projectrelease:view
+    - projectrelease:create
+    - resourcereleasebinding:view
+    - resourcereleasebinding:create
+    - resourcereleasebinding:update
+    - resourcereleasebinding:delete
+    - projectreleasebinding:view
+    - projectreleasebinding:create
+    - projectreleasebinding:update
+    - projectreleasebinding:delete
+    - workflowrun:view
+    - workflowrun:create
+    - workflowrun:delete
+    - secretreference:view
+    - secretreference:create
+    - secretreference:update
+    - secretreference:delete
+    - workload:view
+    - workload:create
+    - workload:update
+    - workload:delete
+    - logs:view
+    - events:view
+    - metrics:view
+    - traces:view
+    - alerts:view
+    - rcareport:view
+    - finopsreport:view
+    - portal-assistant:invoke

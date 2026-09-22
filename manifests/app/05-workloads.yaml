@@ -1,0 +1,187 @@
+# D5 — Workloads for the six pre-built components.
+#
+# !! TWO EDITS BEFORE APPLYING !!
+#   * <REGISTRY> is where YOU pushed the images (docs/BUILD-IMAGES.md). One set of
+#     images serves every deployment of this application.
+#   * API_BASE_URL on the two frontends is loan-api-go's EXTERNAL url, which does
+#     not exist until loan-api-go is deployed (D6/D7). Read it from the binding:
+#       occ releasebinding get loan-api-go-development -n kifaru-bank   # status.endpoints
+#     Apply those two last, or apply now and re-apply once you have the URL —
+#     updating a Workload cuts a new release and redeploys.
+#
+# THREE RULES, each of which bites otherwise:
+#   * spec.owner is IMMUTABLE. A typo means deleting the Workload.
+#   * every env entry needs exactly ONE of `value` or `valueFrom`.
+#   * `endpoints` is a MAP keyed by endpoint name (port + type required) --
+#     an array is rejected, whatever the repo-side workload.yaml looks like.
+#
+# Dependencies are declared, not configured: `dependencies.resources` binds a
+# Resource's outputs to env vars by name; `dependencies.endpoints` binds another
+# component's in-cell address. A typo in an output name is silent until reconcile
+# and shows as OutputNotResolved.
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: credit-scoring-workload
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+    componentName: credit-scoring
+  container:
+    image: <REGISTRY>/kifaru-credit-scoring:v1
+    env:
+      - key: PORT
+        value: "8081"
+      - key: LOG_LEVEL
+        value: info
+      - key: BAL_CONFIG_VAR_BALLERINA_LOG_FORMAT
+        value: json
+  endpoints:
+    http:
+      type: HTTP
+      port: 8081
+      # [project] NOT [external]. internal-engine refuses external endpoints --
+      # switching this to [external] is the Act 2 refusal beat (D10).
+      visibility:
+        - project
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: payment-rail-stub-workload
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+    componentName: payment-rail-stub
+  container:
+    image: <REGISTRY>/kifaru-payment-rail-stub:v1
+    env:
+      - key: PORT
+        value: "8080"
+      - key: LOG_LEVEL
+        value: info
+      - key: FAIL_RATE
+        value: "0"
+      - key: LATENCY_MS
+        value: "150"
+  endpoints:
+    http:
+      type: HTTP
+      port: 8080
+      visibility:
+        - project
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: disbursement-worker-workload
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+    componentName: disbursement-worker
+  container:
+    image: <REGISTRY>/kifaru-disbursement-worker:v1
+    env:
+      - key: LOG_LEVEL
+        value: info
+      - key: ADMIN_PORT
+        value: "9090"
+      - key: IDEMPOTENCY_TTL_HOURS
+        value: "168"
+      # Should be a SecretReference. Left literal because the OpenBao secret store
+      # is not configured -- say so on stage rather than being asked.
+      - key: PAYMENT_RAIL_API_KEY
+        value: local-dev-key-not-a-real-secret
+  # NO endpoints block: event-consumer refuses any endpoint. The admin port on
+  # 9090 is not a service endpoint, which is exactly the shape the type encodes.
+  dependencies:
+    resources:
+      - ref: loans-db
+        envBindings:
+          url: DATABASE_URL
+      - ref: loan-events
+        envBindings:
+          url: NATS_URL
+      - ref: disb-claims
+        envBindings:
+          url: VALKEY_URL
+    endpoints:
+      - component: payment-rail-stub
+        name: http
+        visibility: project
+        envBindings:
+          address: PAYMENT_RAIL_URL
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: arrears-eod-workload
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+    componentName: arrears-eod
+  container:
+    image: <REGISTRY>/kifaru-arrears-eod:v1
+    env:
+      - key: LOG_LEVEL
+        value: info
+  dependencies:
+    resources:
+      - ref: loans-db
+        envBindings:
+          url: DATABASE_URL
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: loan-officer-console-workload
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+    componentName: loan-officer-console
+  container:
+    image: <REGISTRY>/kifaru-loan-officer-console:v1
+    env:
+      - key: PORT
+        value: "8080"
+      - key: LOG_LEVEL
+        value: info
+      - key: API_BASE_URL
+        value: REPLACE_WITH_LOAN_API_EXTERNAL_URL
+  endpoints:
+    http:
+      type: HTTP
+      port: 8080
+      visibility:
+        - external
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: loan-application-portal-workload
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+    componentName: loan-application-portal
+  container:
+    image: <REGISTRY>/kifaru-loan-application-portal:v1
+    env:
+      - key: PORT
+        value: "8080"
+      - key: LOG_LEVEL
+        value: info
+      - key: API_BASE_URL
+        value: REPLACE_WITH_LOAN_API_EXTERNAL_URL
+  endpoints:
+    http:
+      type: HTTP
+      port: 8080
+      visibility:
+        - external

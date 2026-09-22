@@ -1,0 +1,489 @@
+===============================================================================
+ PHASE 3 TEST STEPS — loan-api + payment-rail-stub
+ 30 numbered steps. Run them in order. Each has RUN: and EXPECT:.
+===============================================================================
+
+ START HERE:  cd <repo>/tutorial-1
+
+ EVERY `make` COMMAND MUST RUN FROM THAT DIRECTORY — it is where the Makefile
+ lives. Running make anywhere else gives "No rule to make target", which means
+ wrong directory, not broken Makefile. Check with `pwd`.
+
+ INDEX
+   STEPS  1-4    Setup — get the stack running
+   STEPS  5-7    Automated suites (tests, smoke, hardening)
+   STEPS  8-14   POST /applications — the main flow
+   STEPS 15-19   Validation — the §7.1 rules
+   STEPS 20-24   GET endpoints
+   STEPS 25-27   Failure handling — scoring down, 503, PENDING
+   STEPS 28-30   payment-rail-stub
+   NOTES         Background, known deviations, troubleshooting
+
+ IN A HURRY? Steps 2, 5, 6, 8 alone show Phase 3 works.
+
+ WHAT PHASE 3 IS
+   loan-api  — the public front door (§7.1). Validates, persists, calls
+               credit-scoring, publishes to NATS.
+   payment-rail-stub — a fake mobile money provider (§7.6). NOTHING CALLS IT
+               YET; the disbursement-worker does, in phase 4. It is here so
+               that worker has a target ready.
+
+ WHAT STILL FAILS ON PURPOSE
+   Scenario 1's disbursement assertions. loan-api approves a loan and publishes
+   loan.approved, but the rows in `disbursements` and `repayments` are written
+   by the disbursement-worker, which is phase 4. §12 predicts this exactly:
+   "Scenarios 1 and 3 pass (disbursement assertions will fail — expected, no
+   worker yet)." So `make smoke` exits non-zero at this phase. That is correct.
+
+
+===============================================================================
+ SETUP
+===============================================================================
+
+--- STEP 1 -------------------------------------------------------------------
+Toolchain check.
+
+  RUN:     make doctor
+
+  EXPECT:  all lines "OK", final line "doctor: clean"
+
+
+--- STEP 2 -------------------------------------------------------------------
+Build and start. First run builds two new images; the Ballerina one takes a few
+minutes.
+
+  RUN:     make up
+
+  EXPECT:  six services healthy — postgres, nats, valkey, credit-scoring,
+           payment-rail-stub, loan-api. nats-init runs once and exits 0.
+
+
+--- STEP 3 -------------------------------------------------------------------
+Seed the four historical loans (phase 1 data).
+
+  RUN:     make seed
+
+  EXPECT:  a four-row summary, then "migrate: done"
+
+
+--- STEP 4 -------------------------------------------------------------------
+Load psql settings. Once per terminal; steps below depend on it.
+
+  RUN:     set -a && . ./.env && set +a
+           curl -s localhost:8080/healthz
+
+  EXPECT:  {"status":"ok"}
+
+
+===============================================================================
+ AUTOMATED SUITES
+===============================================================================
+
+--- STEP 5 -------------------------------------------------------------------
+All unit tests.
+
+  RUN:     make test
+
+  EXPECT:  credit-scoring   19 passing, 0 failing
+           loan-api         11 passing, 0 failing
+           payment-rail-stub  ok
+
+  loan-api's 11 cover the §7.1 validation rules and DATABASE_URL parsing. They
+  are pure — no database, no NATS, no credit-scoring needed.
+
+
+--- STEP 6 -------------------------------------------------------------------
+The smoke scenarios.  [THE PHASE 3 CHECKPOINT]
+
+  RUN:     make smoke
+
+  EXPECT:  exactly this, including the FAIL —
+
+    [1/5] approval and disbursement ......... FAIL   (score 712, expected 1 disbursement got 0 — no worker until phase 4)
+    [2/5] duplicate submission .............. PEND   (200 + no re-score OK; suppression needs worker, phase 4)
+    [3/5] decline ........................... PASS   (score 480, 0 disbursements after 3s)
+    [4/5] arrears classification ............ PEND   (needs arrears-eod, phase 5)
+    [5/5] isolation check ................... PASS   (scoring reachable in-network)
+
+    2 passed, 1 failed, 2 pending
+
+  The FAIL on line 1 IS the expected Phase 3 result — its HTTP assertions
+  (201 / 712 / APPROVED) pass; only the worker-written rows are missing.
+  The command exits non-zero because of it. Phase 4 turns it green.
+
+
+--- STEP 7 -------------------------------------------------------------------
+Container hardening (§11). Needs `make up` first — loan-api will not start
+without its dependencies.
+
+  RUN:     make verify-hardened
+
+  EXPECT:  credit-scoring           PASS
+           loan-api                 PASS
+           payment-rail-stub        PASS
+
+
+===============================================================================
+ POST /applications — THE MAIN FLOW
+===============================================================================
+
+--- STEP 8 -------------------------------------------------------------------
+Start clean, then submit APP-100244. THE key path.
+
+  RUN:     psql -q -c "DELETE FROM loan_applications WHERE application_id IN ('APP-100244','APP-100245');"
+           curl -s -o /tmp/r1 -w 'HTTP %{http_code}\n' -X POST localhost:8080/applications \
+                -H 'Content-Type: application/json' -d @demo/payloads/APP-100244.json
+           jq -c '{application_id,score,decision}' /tmp/r1
+
+  EXPECT:  HTTP 201
+           {"application_id":"APP-100244","score":712,"decision":"APPROVED"}
+
+  loan-api called credit-scoring to get that 712 — it does no scoring itself.
+
+
+--- STEP 9 -------------------------------------------------------------------
+It was persisted.
+
+  RUN:     psql -c "SELECT application_id, score, decision, decided_at IS NOT NULL AS decided
+                      FROM loan_applications WHERE application_id='APP-100244';"
+
+  EXPECT:  APP-100244 | 712 | APPROVED | t
+
+
+--- STEP 10 ------------------------------------------------------------------
+loan.approved was published to NATS (§8).
+
+  RUN:     docker run --rm --network kifaru_default natsio/nats-box:latest \
+             nats --server nats:4222 stream info LOANS 2>&1 | grep -i messages
+
+  EXPECT:  Messages: 2   (loan.submitted and loan.approved)
+
+
+--- STEP 11 ------------------------------------------------------------------
+DUPLICATE SUBMISSION — the behaviour the demo rests on (§7.1).
+Submit the identical payload again.
+
+  RUN:     curl -s -o /tmp/r2 -w 'HTTP %{http_code}\n' -X POST localhost:8080/applications \
+                -H 'Content-Type: application/json' -d @demo/payloads/APP-100244.json
+           echo "decided_at unchanged: $([ "$(jq -r .decided_at /tmp/r1)" = "$(jq -r .decided_at /tmp/r2)" ] && echo YES || echo NO)"
+
+  EXPECT:  HTTP 200          (200 on a duplicate, not 201)
+           decided_at unchanged: YES
+
+  The unchanged decided_at proves it did NOT re-score.
+
+
+--- STEP 12 ------------------------------------------------------------------
+And it did NOT re-publish.
+
+  RUN:     Re-run step 10's command.
+
+  EXPECT:  Messages: 2   — still 2, not 4.
+
+  This matters: a duplicate that re-published would make the worker disburse
+  twice, which is the exact failure scenario 2 exists to catch.
+
+
+--- STEP 13 ------------------------------------------------------------------
+The log line the presenter points at.
+
+  RUN:     docker compose logs loan-api | grep -i duplicate | tail -2
+
+  EXPECT:  a JSON line with "message":"duplicate submission ignored" and
+           "application_id":"APP-100244"
+
+
+--- STEP 14 ------------------------------------------------------------------
+The decline path.
+
+  RUN:     curl -s -o /tmp/r3 -w 'HTTP %{http_code}\n' -X POST localhost:8080/applications \
+                -H 'Content-Type: application/json' -d @demo/payloads/APP-100245.json
+           jq -c '{score,decision}' /tmp/r3
+
+  EXPECT:  HTTP 201
+           {"score":480,"decision":"DECLINED"}
+
+  No loan.approved is published for a declined loan — step 10's count stays at
+  3 (the extra one being APP-100245's loan.submitted), never 4.
+
+
+===============================================================================
+ VALIDATION  (§7.1)
+===============================================================================
+
+--- STEP 15 ------------------------------------------------------------------
+All failures are reported together, not just the first.
+
+  RUN:     curl -s -X POST localhost:8080/applications -H 'Content-Type: application/json' \
+             -d '{"applicant_name":"","national_id":"","wallet_msisdn":"0712345678",
+                  "amount_kes":100,"term_months":7,"monthly_income":0,
+                  "employment_months":-1,"kyc_verified":false}' | jq .
+
+  EXPECT:  HTTP 400 and SEVEN field errors in one response —
+             applicant_name      must not be empty
+             national_id         must not be empty
+             wallet_msisdn       must match 254 followed by 1 or 7 and 8 digits
+             amount_kes          must be between 10000 and 2000000
+             term_months         must be one of 6, 12, 24, 36
+             monthly_income      must be greater than 0
+             employment_months   must not be negative
+
+
+--- STEP 16 ------------------------------------------------------------------
+Amount bounds: 10,000 - 2,000,000 KES inclusive.
+
+  RUN:     for amt in 9999 10000 2000000 2000001; do \
+             printf '%10s -> ' "$amt"; \
+             curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8080/applications \
+               -H 'Content-Type: application/json' \
+               -d "{\"applicant_name\":\"T\",\"national_id\":\"1\",\"wallet_msisdn\":\"254711111111\",
+                    \"amount_kes\":$amt,\"term_months\":12,\"monthly_income\":50000,
+                    \"employment_months\":12,\"kyc_verified\":true}"; \
+           done
+
+  EXPECT:  9999 -> 400,  10000 -> 201,  2000000 -> 201,  2000001 -> 400
+
+
+--- STEP 17 ------------------------------------------------------------------
+Term must be one of 6, 12, 24, 36.
+
+  RUN:     same shape as step 16, varying term_months over 6 12 18 24 36 48
+
+  EXPECT:  6/12/24/36 accepted; 18 and 48 rejected with 400
+
+
+--- STEP 18 ------------------------------------------------------------------
+MSISDN must match ^254[17]\d{8}$.
+
+  RUN:     same shape, varying wallet_msisdn over
+             254712345678  254112345678  254812345678  0712345678  +254712345678
+
+  EXPECT:  the first two accepted; the last three rejected with 400.
+           (Third digit must be 1 or 7, so 2548... fails.)
+
+
+--- STEP 19 ------------------------------------------------------------------
+application_id is optional — omit it and one is generated (§7.1).
+
+  RUN:     curl -s -X POST localhost:8080/applications -H 'Content-Type: application/json' \
+             -d '{"applicant_name":"Gen Test","national_id":"55555555",
+                  "wallet_msisdn":"254711111111","amount_kes":50000,"term_months":12,
+                  "monthly_income":40000,"employment_months":12,"kyc_verified":true}' \
+             | jq -c '{application_id,score,decision}'
+
+  EXPECT:  an application_id of the form APP-###### (six digits), plus a score.
+           Example: {"application_id":"APP-229156","score":582,"decision":"DECLINED"}
+
+  CLEAN UP afterwards:
+           psql -q -c "DELETE FROM loan_applications WHERE applicant_name IN ('T','Gen Test');"
+
+
+===============================================================================
+ GET ENDPOINTS
+===============================================================================
+
+--- STEP 20 ------------------------------------------------------------------
+Fetch one, with everything §7.1 asks for.
+
+  RUN:     curl -s localhost:8080/applications/APP-100244 \
+             | jq -c '{application_id,score,decision,arrears_bucket,disbursement,
+                       instalments:(.repayments|length)}'
+
+  EXPECT:  {"application_id":"APP-100244","score":712,"decision":"APPROVED",
+            "arrears_bucket":null,"disbursement":null,"instalments":0}
+
+  disbursement and repayments are null/0 because the WORKER writes them (phase 4);
+  arrears_bucket is null because arrears-eod has not run (phase 5). All three
+  populate in later phases without any change to this endpoint.
+
+
+--- STEP 21 ------------------------------------------------------------------
+Unknown id is a 404, not a 500.
+
+  RUN:     curl -s -w '\nHTTP %{http_code}\n' localhost:8080/applications/APP-NOPE
+
+  EXPECT:  {"message":"no application APP-NOPE"}
+           HTTP 404
+
+  (This returned 500 before being fixed: Ballerina's queryRow raises
+   sql:NoRowsError rather than returning nil, so "not found" has to be told
+   apart from a genuine database fault.)
+
+
+--- STEP 22 ------------------------------------------------------------------
+List, newest first.
+
+  RUN:     curl -s 'localhost:8080/applications?limit=3' \
+             | jq -c '.[] | {application_id,score,decision}'
+
+  EXPECT:  up to 3 rows, most recently submitted first.
+
+
+--- STEP 23 ------------------------------------------------------------------
+Bucket filter.
+
+  RUN:     curl -s 'localhost:8080/applications?bucket=NPL_90_PLUS' | jq length
+
+  EXPECT:  0 at this phase — CORRECT, not a bug. The filter joins
+           arrears_classification, which arrears-eod populates in phase 5.
+           Confirm the table really is empty:
+
+           psql -tAc "SELECT count(*) FROM arrears_classification;"    -> 0
+
+
+--- STEP 24 ------------------------------------------------------------------
+Liveness and readiness (§7.1).
+
+  RUN:     curl -s localhost:8080/healthz
+           curl -s localhost:8080/readyz
+
+  EXPECT:  {"status":"ok"}
+           {"status":"ready"}
+
+  healthz does NO dependency checks by design; readyz checks the database and
+  NATS. Step 25 shows the difference mattering.
+
+
+===============================================================================
+ FAILURE HANDLING
+===============================================================================
+
+--- STEP 25 ------------------------------------------------------------------
+Scoring unavailable must NEVER approve (§7.1). Stop credit-scoring.
+
+  RUN:     docker compose stop credit-scoring
+           curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8080/applications \
+             -H 'Content-Type: application/json' \
+             -d '{"application_id":"APP-PENDING1","applicant_name":"Pending Test",
+                  "national_id":"77777777","wallet_msisdn":"254722222222",
+                  "amount_kes":100000,"term_months":12,"monthly_income":50000,
+                  "employment_months":24,"kyc_verified":true,"existing_defaults":0}'
+
+  EXPECT:  {"message":"scoring service unavailable, application left pending"}
+           HTTP 503
+
+  A banking audience will ask about this: an unavailable risk engine produces NO
+  decision, never a permissive default.
+
+
+--- STEP 26 ------------------------------------------------------------------
+The record is PENDING with no score, and nothing was published.
+
+  RUN:     psql -c "SELECT application_id, score, decision FROM loan_applications
+                     WHERE application_id='APP-PENDING1';"
+
+  EXPECT:  APP-PENDING1 | (null) | PENDING
+
+
+--- STEP 27 ------------------------------------------------------------------
+Bring scoring back; the PENDING record is re-scored on retry.
+
+  RUN:     docker compose start credit-scoring && sleep 12
+           curl -s -o /tmp/p2 -w 'HTTP %{http_code}\n' -X POST localhost:8080/applications \
+             -H 'Content-Type: application/json' \
+             -d '{"application_id":"APP-PENDING1","applicant_name":"Pending Test",
+                  "national_id":"77777777","wallet_msisdn":"254722222222",
+                  "amount_kes":100000,"term_months":12,"monthly_income":50000,
+                  "employment_months":24,"kyc_verified":true,"existing_defaults":0}'
+           jq -c '{score,decision}' /tmp/p2
+
+  EXPECT:  HTTP 201 and a real score, e.g. {"score":614,"decision":"DECLINED"}
+
+  See NOTE 2 — this is a deliberate reading of §7.1, not the literal text.
+
+  CLEAN UP:  psql -q -c "DELETE FROM loan_applications WHERE application_id='APP-PENDING1';"
+
+
+===============================================================================
+ payment-rail-stub  (§7.6)
+===============================================================================
+ Nothing calls this until phase 4. These steps confirm it is ready.
+
+--- STEP 28 ------------------------------------------------------------------
+First payment returns 201 with a new provider_ref.
+
+  RUN:     curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8082/v1/payments \
+             -H 'Content-Type: application/json' -H 'Idempotency-Key: APP-100244' \
+             -d '{"application_id":"APP-100244","amount_kes":250000,
+                  "wallet_msisdn":"254712345678"}'
+
+  EXPECT:  {"provider_ref":"PR-<uuid>","status":"SENT"}
+           HTTP 201
+
+
+--- STEP 29 ------------------------------------------------------------------
+IDEMPOTENCY — the same key returns the SAME ref with duplicate:true.
+
+  RUN:     the exact same command again
+
+  EXPECT:  HTTP 200 (not 201), the IDENTICAL provider_ref, and "duplicate":true
+
+  This is the stub's half of the no-double-payment story. The worker's Valkey
+  claim (phase 4) is the other, more important half.
+
+
+--- STEP 30 ------------------------------------------------------------------
+A missing Idempotency-Key is rejected.
+
+  RUN:     curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8082/v1/payments \
+             -H 'Content-Type: application/json' -d '{"application_id":"X"}'
+
+  EXPECT:  400
+
+
+===============================================================================
+ NOTES — background, not steps
+===============================================================================
+
+NOTE 1 — traceparent travels in the PAYLOAD, not the NATS header
+  §8 says every event carries traceparent in the NATS header. ballerinax/nats
+  3.3.2 (the latest release) exposes NO header API at all — neither
+  AnydataMessage nor JetStreamMessage has a headers field. So traceparent is a
+  FIELD IN THE JSON EVENT BODY instead. The outcome §2.6 wants is preserved (the
+  trace still crosses the broker unbroken), but phase 4's worker must read it
+  from the body. Open with the spec author.
+
+  Inspect an event body:
+      docker run --rm --network kifaru_default natsio/nats-box:latest \
+        nats --server nats:4222 stream get LOANS 2
+
+NOTE 2 — why a PENDING record is re-scored (step 27)
+  §7.1 says a duplicate application_id returns 200 with the existing record and
+  does not re-score. Read literally that also applies to a PENDING record — one
+  whose scoring call failed — which would strand the loan with no path to a
+  decision, forever. So the duplicate rule is applied to DECIDED records
+  (APPROVED / DECLINED) only, and a PENDING one is scored on retry. Scenarios 2
+  and 3 are unaffected, since both act on decided loans. Open with the spec author.
+
+NOTE 3 — /metrics returns 404 on both Ballerina services
+  §7.1 and §7.2 list it, but §3.2 says use Ballerina's BUILT-IN Prometheus
+  metrics and add no libraries — and the runtime serves those on its own
+  observability port (9797), not the service port. Not a phase 3 checkpoint.
+
+NOTE 4 — images
+      loan-api           439MB   (Ballerina; §11 expects 200-300MB, "not worth fighting")
+      payment-rail-stub  14.3MB  (Go distroless; §11 allows under 40MB)
+
+NOTE 5 — "error: ... is required but was not set"
+  loan-api requires DATABASE_URL, NATS_URL, CREDIT_SCORING_URL and LOG_LEVEL. It
+  refuses to start without them, by design (§3.2). To run from source:
+
+      cd app/loan-api
+      LOG_LEVEL=info DATABASE_URL=postgres://kifaru:kifaru_local_only@localhost:5432/kifaru \
+      NATS_URL=nats://localhost:4222 CREDIT_SCORING_URL=http://localhost:8081 bal run
+      cd -
+
+  `make test` supplies placeholders for you. loan-api connects to the database
+  and NATS LAZILY — on first use, not at startup — so the unit tests need
+  neither running.
+
+NOTE 6 — what phase 4 changes
+  disbursement-worker consumes loan.approved, claims the loan in Valkey, calls
+  payment-rail-stub, writes the disbursement row and generates the repayment
+  schedule. Step 6's scenario 1 goes green, scenario 2 becomes assertable, and
+  step 20's disbursement/instalments stop being null/0.
+
+NOTE 7 — earlier phases
+      demo/PHASE1-MANUAL-TESTS.txt   data layer, seed, constraints
+      demo/PHASE2-MANUAL-TESTS.txt   credit-scoring
+===============================================================================

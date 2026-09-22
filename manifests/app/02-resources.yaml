@@ -1,0 +1,52 @@
+# D2 — the three infrastructure Resources.
+#
+# These only DECLARE the infrastructure. Nothing runs until each one is bound to
+# an environment — see 22-resource-bindings.yaml.
+#
+# All three types are the team's own namespace-scoped ResourceTypes
+# (manifests/platform/10-resourcetype-postgres.yaml, 11-…-nats.yaml, 12-…-valkey.yaml).
+# postgres is the only one that takes a parameter. type is IMMUTABLE.
+#
+# What each one hands to a Workload, by output name (bind with envBindings):
+#   postgres  host port database username password url adminURL
+#   nats      host port token url adminURL            (JetStream enabled)
+#   valkey    host port password url connectionString adminURL
+# `url` is what the application wants — DATABASE_URL, NATS_URL, VALKEY_URL.
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Resource
+metadata:
+  name: loans-db
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+  type:
+    kind: ResourceType
+    name: postgres
+  parameters:
+    database: kifaru
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Resource
+metadata:
+  name: loan-events
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+  type:
+    kind: ResourceType
+    name: nats
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Resource
+metadata:
+  name: disb-claims
+  namespace: kifaru-bank
+spec:
+  owner:
+    projectName: lending
+  type:
+    kind: ResourceType
+    name: valkey

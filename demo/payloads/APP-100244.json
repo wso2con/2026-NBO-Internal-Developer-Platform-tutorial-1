@@ -1,0 +1,12 @@
+{
+  "application_id": "APP-100244",
+  "applicant_name": "Amina W.",
+  "national_id": "12345678",
+  "wallet_msisdn": "254712345678",
+  "amount_kes": 250000,
+  "term_months": 24,
+  "monthly_income": 96000,
+  "employment_months": 30,
+  "kyc_verified": true,
+  "existing_defaults": 0
+}

@@ -1,0 +1,180 @@
+# P5b — event-consumer
+#
+# DERIVED FROM the shipped ClusterComponentType/worker.
+# The "no endpoints" rule is the shipped worker rule, reworded for the bank —
+# say so on stage rather than claiming it as new. What IS new:
+#   1. allowedWorkflows narrowed to dockerfile-builder
+#   2. the production replica floor
+#
+# Developers reference this as: deployment/event-consumer
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ComponentType
+metadata:
+  name: event-consumer
+  namespace: kifaru-bank
+  annotations:
+    openchoreo.dev/display-name: Kifaru Event Consumer
+    openchoreo.dev/description: A long-running component that consumes from the message
+      broker and exposes no service endpoint.
+spec:
+  allowedTraits:
+  - kind: ClusterTrait
+    name: observability-alert-rule
+  allowedWorkflows:
+  - kind: ClusterWorkflow
+    name: dockerfile-builder
+  environmentConfigs:
+    openAPIV3Schema:
+      "$defs":
+        ResourceQuantity:
+          default: {}
+          properties:
+            cpu:
+              default: 100m
+              type: string
+            memory:
+              default: 256Mi
+              type: string
+          type: object
+        ResourceRequirements:
+          default: {}
+          properties:
+            limits:
+              "$ref": "#/$defs/ResourceQuantity"
+            requests:
+              "$ref": "#/$defs/ResourceQuantity"
+          type: object
+      properties:
+        imagePullPolicy:
+          default: IfNotPresent
+          enum:
+          - Always
+          - IfNotPresent
+          - Never
+          type: string
+        replicas:
+          default: 1
+          minimum: 0
+          type: integer
+        resources:
+          "$ref": "#/$defs/ResourceRequirements"
+      type: object
+  resources:
+  - id: deployment
+    targetPlane: dataplane
+    template:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        labels: "${metadata.labels}"
+        name: "${metadata.name}"
+        namespace: "${metadata.namespace}"
+      spec:
+        replicas: "${environmentConfigs.replicas}"
+        selector:
+          matchLabels: "${metadata.podSelectors}"
+        template:
+          metadata:
+            labels: "${metadata.podSelectors}"
+          spec:
+            containers:
+            - args: "${has(workload.container.args) ? workload.container.args : oc_omit()}\n"
+              command: "${has(workload.container.command) ? workload.container.command
+                : oc_omit()}\n"
+              env: "${dependencies.toContainerEnvs()}"
+              envFrom: "${configurations.toContainerEnvFrom()}"
+              image: "${workload.container.image}"
+              imagePullPolicy: "${environmentConfigs.imagePullPolicy}"
+              name: main
+              resources:
+                limits:
+                  cpu: "${environmentConfigs.resources.limits.cpu}"
+                  memory: "${environmentConfigs.resources.limits.memory}"
+                requests:
+                  cpu: "${environmentConfigs.resources.requests.cpu}"
+                  memory: "${environmentConfigs.resources.requests.memory}"
+              volumeMounts: "${configurations.toContainerVolumeMounts() + dependencies.toContainerVolumeMounts()}"
+            volumes: "${configurations.toVolumes() + dependencies.toVolumes()}"
+  - forEach: "${configurations.toConfigEnvsByContainer()}"
+    id: env-config
+    targetPlane: dataplane
+    template:
+      apiVersion: v1
+      data: "${envConfig.envs.transformMapEntry(index, env, {env.name: env.value})}\n"
+      kind: ConfigMap
+      metadata:
+        name: "${envConfig.resourceName}"
+        namespace: "${metadata.namespace}"
+    var: envConfig
+  - forEach: "${configurations.toConfigFileList()}"
+    id: file-config
+    targetPlane: dataplane
+    template:
+      apiVersion: v1
+      data:
+        "${config.name}": "${config.value}\n"
+      kind: ConfigMap
+      metadata:
+        name: "${config.resourceName}"
+        namespace: "${metadata.namespace}"
+    var: config
+  - forEach: "${configurations.toSecretEnvsByContainer()}"
+    id: secret-env-external
+    targetPlane: dataplane
+    template:
+      apiVersion: external-secrets.io/v1
+      kind: ExternalSecret
+      metadata:
+        name: "${secretEnv.resourceName}"
+        namespace: "${metadata.namespace}"
+      spec:
+        data: |
+          ${secretEnv.envs.map(secret, {
+            "secretKey": secret.name,
+            "remoteRef": {
+              "key": secret.remoteRef.key,
+              ?"property": secret.remoteRef.?property
+            }
+          })}
+        refreshInterval: 15s
+        secretStoreRef:
+          kind: ClusterSecretStore
+          name: "${dataplane.secretStore}"
+        target:
+          creationPolicy: Owner
+          name: "${secretEnv.resourceName}"
+    var: secretEnv
+  - forEach: "${configurations.toSecretFileList()}"
+    id: secret-file-external
+    targetPlane: dataplane
+    template:
+      apiVersion: external-secrets.io/v1
+      kind: ExternalSecret
+      metadata:
+        name: "${file.resourceName}"
+        namespace: "${metadata.namespace}"
+      spec:
+        data:
+        - remoteRef:
+            key: "${file.remoteRef.key}"
+            property: "${has(file.remoteRef.property) ? file.remoteRef.property :
+              oc_omit()}\n"
+          secretKey: "${file.name}"
+        refreshInterval: 15s
+        secretStoreRef:
+          kind: ClusterSecretStore
+          name: "${dataplane.secretStore}"
+        target:
+          creationPolicy: Owner
+          name: "${file.resourceName}"
+    var: file
+  validations:
+  - rule: "${size(workload.endpoints) == 0}"
+    message: Event consumers must not expose endpoints. They consume from the broker;
+      health probes belong on the admin port.
+  - rule: ${metadata.environmentName != "production" || environmentConfigs.replicas
+      >= 2}
+    message: Production requires at least two replicas. Single-replica workloads are
+      not permitted in a production environment.
+  workloadType: deployment

@@ -1,0 +1,221 @@
+/* index.css — Kifaru Bank loan officer console (BUILD-SPEC.md §7.5).
+ *
+ * Restrained and bank-ish: navy and white, no gradients, generous whitespace.
+ * This appears on a projector in a large room, so the base size is 18px rather
+ * than the usual 16 and the table type is deliberately large.
+ */
+
+:root {
+  --navy: #0d2240;
+  --navy-light: #1b3a63;
+  --ink: #16202e;
+  --muted: #5b6b7f;
+  --line: #d8dee7;
+  --page: #ffffff;
+  --panel: #f6f8fa;
+
+  /* Status colours, kept muted — this is a bank, not a dashboard. */
+  --approved: #1c6b3f;
+  --declined: #9b2226;
+  --pending: #8a6d1f;
+
+  --npl: #9b2226;
+  --dpd-61: #b5502b;
+  --dpd-31: #a8791c;
+  --dpd-1: #6b7a20;
+  --current: #1c6b3f;
+
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+  font-size: 18px;
+  color: var(--ink);
+  background: var(--page);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--page);
+}
+
+/* --- header ---------------------------------------------------------------- */
+
+.masthead {
+  background: var(--navy);
+  color: #fff;
+  padding: 1.1rem 2rem;
+  display: flex;
+  align-items: center;
+  gap: 2.5rem;
+}
+
+/* Logo + name + descriptor sit on one baseline-ish row. The mark inherits the
+   masthead's white via fill="currentColor", so there is no inverted asset. */
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.wordmark .name {
+  font-size: 1.55rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.wordmark .sub {
+  font-weight: 300;
+  opacity: 0.75;
+  font-size: 1.05rem;
+}
+
+nav { display: flex; gap: 0.5rem; margin-left: auto; }
+
+nav button {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  color: #fff;
+  font: inherit;
+  font-size: 1rem;
+  padding: 0.45rem 1.1rem;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+nav button:hover { background: var(--navy-light); }
+nav button[aria-current='page'] { background: #fff; color: var(--navy); font-weight: 600; }
+
+/* --- layout ---------------------------------------------------------------- */
+
+main { padding: 2rem; max-width: 1500px; margin: 0 auto; }
+
+h1 { font-size: 1.7rem; margin: 0 0 0.35rem; font-weight: 650; }
+h2 { font-size: 1.25rem; margin: 2rem 0 0.75rem; font-weight: 650; }
+
+.subtitle { color: var(--muted); margin: 0 0 1.75rem; font-size: 1rem; }
+
+.row { display: flex; align-items: center; gap: 1rem; }
+.spacer { flex: 1; }
+
+/* --- tables ---------------------------------------------------------------- */
+
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+
+th {
+  text-align: left;
+  font-size: 0.8rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 0.6rem 1rem;
+  border-bottom: 2px solid var(--line);
+  white-space: nowrap;
+}
+
+td { padding: 0.85rem 1rem; border-bottom: 1px solid var(--line); }
+
+tbody tr.clickable { cursor: pointer; }
+tbody tr.clickable:hover { background: var(--panel); }
+
+.num { text-align: right; }
+.mono { font-variant-numeric: tabular-nums; }
+
+/* --- badges ---------------------------------------------------------------- */
+
+.badge {
+  display: inline-block;
+  padding: 0.2rem 0.6rem;
+  border-radius: 3px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+
+.badge.APPROVED { color: var(--approved); }
+.badge.DECLINED { color: var(--declined); }
+.badge.PENDING  { color: var(--pending); }
+
+.badge.NPL_90_PLUS { color: var(--npl); }
+.badge.DPD_61_90   { color: var(--dpd-61); }
+.badge.DPD_31_60   { color: var(--dpd-31); }
+.badge.DPD_1_30    { color: var(--dpd-1); }
+.badge.CURRENT     { color: var(--current); }
+
+/* --- panels ---------------------------------------------------------------- */
+
+.panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1.25rem 1.5rem;
+}
+
+.panel h3 {
+  margin: 0 0 1rem;
+  font-size: 0.82rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 0.55rem 1.5rem; }
+dt { color: var(--muted); font-size: 0.95rem; }
+dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* --- score breakdown -------------------------------------------------------- */
+
+.factors { display: grid; gap: 0.4rem; }
+
+.factor { display: grid; grid-template-columns: 9rem 1fr 4rem; align-items: center; gap: 0.75rem; }
+.factor-name { color: var(--muted); font-size: 0.95rem; text-transform: capitalize; }
+.factor-bar { height: 12px; background: #e4e9f0; border-radius: 2px; overflow: hidden; }
+.factor-bar div { height: 100%; background: var(--navy-light); }
+.factor-bar div.negative { background: var(--declined); }
+.factor-points { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+
+.score-total {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+.score-total strong { font-size: 2.1rem; font-weight: 700; }
+
+/* --- repayment schedule ----------------------------------------------------- */
+
+tr.overdue { background: #fdf3f3; }
+tr.overdue td:first-child { box-shadow: inset 3px 0 0 var(--declined); }
+tr.paid { color: var(--muted); }
+
+/* --- arrears queue ---------------------------------------------------------- */
+
+.bucket-group { margin-bottom: 2.5rem; }
+
+.bucket-head { display: flex; align-items: baseline; gap: 1rem; margin-bottom: 0.6rem; }
+.bucket-head h2 { margin: 0; }
+.bucket-head .action { color: var(--muted); font-size: 0.95rem; }
+.bucket-head .exposure { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; }
+
+/* --- misc ------------------------------------------------------------------- */
+
+.link {
+  background: none;
+  border: none;
+  color: var(--navy-light);
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.notice { padding: 1.25rem 1.5rem; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); }
+.notice.error { border-color: var(--declined); color: var(--declined); background: #fdf3f3; }
+
+.refresh { color: var(--muted); font-size: 0.9rem; }

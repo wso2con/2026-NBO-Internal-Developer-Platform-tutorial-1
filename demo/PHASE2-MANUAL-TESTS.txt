@@ -1,0 +1,434 @@
+===============================================================================
+ PHASE 2 TEST STEPS — credit-scoring service
+ 26 numbered steps. Run them in order. Each has RUN: and EXPECT:.
+===============================================================================
+
+ START HERE:  cd <repo>/tutorial-1
+
+ EVERY `make` COMMAND MUST RUN FROM THAT DIRECTORY — it is where the Makefile
+ lives. Running make anywhere else gives:
+
+     make: *** No rule to make target `test'.  Stop.
+
+ That means "wrong directory", not "broken Makefile". Check with `pwd`; the
+ path must end in /tutorial-1. A few steps below cd into a service directory —
+ come back before the next make command.
+
+ INDEX
+   STEPS  1-3    Setup — get it running
+   STEPS  4-6    Unit tests
+   STEPS  7-12   HTTP endpoints — the 712 / 480 fixtures
+   STEPS 13-18   Scoring behaviour — change one input, watch one rule move
+   STEPS 19-23   Configuration failures — must exit non-zero
+   STEPS 24-26   Container hardening
+   NOTES         Background, known deviations, troubleshooting (no steps)
+
+ IN A HURRY? Steps 2, 4, 7, 24 alone prove Phase 2 is done.
+
+ IF SOMETHING FAILS: see NOTE 1 at the bottom — the most common "failure" is
+ the service refusing to start without LOG_LEVEL, which is intentional.
+
+
+===============================================================================
+ SETUP
+===============================================================================
+
+--- STEP 1 -------------------------------------------------------------------
+Check the toolchain.
+
+  RUN:     make doctor
+
+  EXPECT:  every line begins "OK", last line "doctor: clean"
+           bal must report 2201.13.6 — it has to match the builder image tag
+           in app/credit-scoring/Dockerfile.
+
+
+--- STEP 2 -------------------------------------------------------------------
+Build and start everything. First run takes a few minutes (the Ballerina
+builder image is ~1GB).
+
+  RUN:     make up
+
+  EXPECT:  postgres, nats, valkey and credit-scoring all "(healthy)"
+
+
+--- STEP 3 -------------------------------------------------------------------
+Confirm the service answers.
+
+  RUN:     curl -s localhost:8081/healthz
+
+  EXPECT:  {"status":"ok"}
+
+
+===============================================================================
+ UNIT TESTS
+===============================================================================
+
+--- STEP 4 -------------------------------------------------------------------
+Run the test suite.  [CHECKPOINT 1 of 4]
+
+  RUN:     make test
+
+  EXPECT:  19 passing
+           0 failing
+           no WARNING or ERROR lines
+
+  Same thing without make — note the `cd -` to come back afterwards, or every
+  later `make` command fails with "No rule to make target":
+
+           cd app/credit-scoring && LOG_LEVEL=info bal test; cd -
+
+
+--- STEP 5 -------------------------------------------------------------------
+Prove the golden test actually bites. Break a rule on purpose.
+
+  RUN:     open app/credit-scoring/scoring.bal
+           change  KYC_VERIFIED_POINTS = 40   to   45
+           make test
+
+  EXPECT:  testGoldenApp100244 and testGoldenApp100245 FAIL, reporting 717
+           and 485 instead of 712 and 480.
+
+
+--- STEP 6 -------------------------------------------------------------------
+Put it back.
+
+  RUN:     change 45 back to 40
+           make test
+
+  EXPECT:  19 passing again.
+
+  Why this matters: §6 says if the implementation disagrees with 712/480, fix
+  the implementation, not the test. Step 5 proves the test would catch that.
+
+
+===============================================================================
+ HTTP ENDPOINTS
+===============================================================================
+
+--- STEP 7 -------------------------------------------------------------------
+The money shot — APP-100244 must score 712.  [CHECKPOINT 2 of 4]
+
+  RUN:     curl -s -X POST localhost:8081/score \
+                -H 'Content-Type: application/json' \
+                -d @demo/payloads/APP-100244.json | jq .
+
+  EXPECT:  {
+             "application_id": "APP-100244",
+             "score": 712,
+             "decision": "APPROVED",
+             "reason": "Affordability strong (DTI 0.15); employment history 30 months; KYC verified",
+             "factors": [
+               { "name": "base",          "points": 300 },
+               { "name": "income",        "points": 192 },
+               { "name": "employment",    "points": 30  },
+               { "name": "affordability", "points": 150 },
+               { "name": "kyc",           "points": 40  }
+             ]
+           }
+
+  CHECK:   the factors sum to the score — 300+192+30+150+40 = 712
+
+
+--- STEP 8 -------------------------------------------------------------------
+APP-100245 must score 480.
+
+  RUN:     curl -s -X POST localhost:8081/score \
+                -H 'Content-Type: application/json' \
+                -d @demo/payloads/APP-100245.json | jq '{score, decision, reason}'
+
+  EXPECT:  score     480
+           decision  "DECLINED"
+           reason    "Affordability tight (DTI 0.45); employment history 24 months; KYC verified"
+
+  CHECK:   300+76+24+40+40 = 480
+
+
+--- STEP 9 -------------------------------------------------------------------
+Status code must be 200 (§7.2), not 201.
+
+  RUN:     curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8081/score \
+                -H 'Content-Type: application/json' -d @demo/payloads/APP-100244.json
+
+  EXPECT:  200
+
+
+--- STEP 10 ------------------------------------------------------------------
+The rules are inspectable.
+
+  RUN:     curl -s localhost:8081/rules | jq .
+
+  EXPECT:  approval_threshold 650, annual_flat_rate 0.18, score range 300-850,
+           and four bands:
+               "< 0.20"        150
+               "0.20 - 0.35"   100
+               "0.35 - 0.50"    40
+               ">= 0.50"      -100
+
+
+--- STEP 11 ------------------------------------------------------------------
+Liveness and readiness.
+
+  RUN:     curl -s localhost:8081/healthz
+           curl -s localhost:8081/readyz
+
+  EXPECT:  {"status":"ok"}
+           {"status":"ready"}
+
+  NOTE:    localhost:8081/metrics returns 404 today — see NOTE 3 below.
+
+
+--- STEP 12 ------------------------------------------------------------------
+Inbound trace context is accepted (§2.6).
+
+  RUN:     curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8081/score \
+             -H 'Content-Type: application/json' \
+             -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+             -d @demo/payloads/APP-100244.json
+
+  EXPECT:  200
+
+
+===============================================================================
+ SCORING BEHAVIOUR
+===============================================================================
+ Each step starts from APP-100244 (which scores 712) and changes exactly ONE
+ field, so any change in score is attributable to that one rule.
+
+ Define this helper once, then steps 13-16 are one-liners:
+
+   score() { curl -s -X POST localhost:8081/score \
+               -H 'Content-Type: application/json' -d "$1" | jq -c '{score,decision}'; }
+
+
+--- STEP 13 ------------------------------------------------------------------
+KYC not verified — costs 120 points (+40 becomes -80).
+
+  RUN:     score '{"application_id":"APP-T1","amount_kes":250000,"term_months":24,
+                   "monthly_income":96000,"employment_months":30,
+                   "kyc_verified":false,"existing_defaults":0}'
+
+  EXPECT:  {"score":592,"decision":"DECLINED"}          712 - 120 = 592
+
+
+--- STEP 14 ------------------------------------------------------------------
+One prior default — costs 150 points AND adds a sixth factor.
+
+  RUN:     curl -s -X POST localhost:8081/score -H 'Content-Type: application/json' \
+             -d '{"application_id":"APP-T2","amount_kes":250000,"term_months":24,
+                  "monthly_income":96000,"employment_months":30,
+                  "kyc_verified":true,"existing_defaults":1}' \
+             | jq -c '{score,decision,factors:[.factors[]|.name]}'
+
+  EXPECT:  score 562, DECLINED, factors
+           ["base","income","employment","affordability","kyc","defaults"]
+
+  CHECK:   the "defaults" factor appears ONLY when it applies, so the happy
+           path in step 7 stays at five factors.
+
+
+--- STEP 15 ------------------------------------------------------------------
+Unaffordable loan — DTI crosses 0.50, affordability swings to -100.
+
+  RUN:     score '{"application_id":"APP-T3","amount_kes":500000,"term_months":12,
+                   "monthly_income":60000,"employment_months":24,
+                   "kyc_verified":true,"existing_defaults":0}'
+
+  EXPECT:  {"score":384,"decision":"DECLINED"}
+           full reason reads "Affordability insufficient (DTI 0.82)"
+
+
+--- STEP 16 ------------------------------------------------------------------
+The score floor — five defaults would take it far below 300.
+
+  RUN:     score '{"application_id":"APP-T4","amount_kes":300000,"term_months":24,
+                   "monthly_income":38000,"employment_months":24,
+                   "kyc_verified":true,"existing_defaults":5}'
+
+  EXPECT:  {"score":300,"decision":"DECLINED"}
+           clamped at the 300 floor, never negative.
+
+
+--- STEP 17 ------------------------------------------------------------------
+Determinism — the property the whole demo leans on.
+
+  RUN:     for i in $(seq 1 20); do \
+             curl -s -X POST localhost:8081/score -H 'Content-Type: application/json' \
+                  -d @demo/payloads/APP-100244.json | jq -c '{score,decision}'; \
+           done | sort -u
+
+  EXPECT:  exactly ONE line:  {"score":712,"decision":"APPROVED"}
+           More than one line means something non-deterministic crept in.
+
+
+--- STEP 18 ------------------------------------------------------------------
+Bad input is rejected with field-level errors.
+
+  RUN:     curl -s -X POST localhost:8081/score -H 'Content-Type: application/json' \
+             -d '{"application_id":"APP-BAD","amount_kes":250000,"term_months":24,
+                  "monthly_income":0,"employment_months":30,
+                  "kyc_verified":true,"existing_defaults":0}' | jq .
+
+  EXPECT:  {
+             "message": "validation failed",
+             "errors": [
+               { "field": "monthly_income", "message": "must be greater than 0" }
+             ]
+           }
+
+
+===============================================================================
+ CONFIGURATION FAILURES
+===============================================================================
+ §3.2: config is read and range-checked ONCE at startup, before the listener
+ starts. A bad value must name the variable and exit non-zero. Each step runs a
+ throwaway container and prints its exit code.
+
+
+--- STEP 19 ------------------------------------------------------------------
+Required variable missing.  [CHECKPOINT 4 of 4]
+
+  RUN:     docker run --rm -e LOG_LEVEL= kifaru/credit-scoring:local; echo "exit=$?"
+
+  EXPECT:  error: LOG_LEVEL is required but was not set
+           exit=1
+
+
+--- STEP 20 ------------------------------------------------------------------
+Required variable present but invalid.
+
+  RUN:     docker run --rm -e LOG_LEVEL=verbose kifaru/credit-scoring:local; echo "exit=$?"
+
+  EXPECT:  error: LOG_LEVEL must be one of debug|info|warn|error, got 'verbose'
+           exit=1
+
+
+--- STEP 21 ------------------------------------------------------------------
+Optional variable, unparseable.
+
+  RUN:     docker run --rm -e PORT=abc kifaru/credit-scoring:local; echo "exit=$?"
+
+  EXPECT:  error: PORT must be an integer, got 'abc'
+           exit=1
+
+
+--- STEP 22 ------------------------------------------------------------------
+Optional variable, out of range.
+
+  RUN:     docker run --rm -e PORT=99999 kifaru/credit-scoring:local; echo "exit=$?"
+
+  EXPECT:  error: PORT must be between 1 and 65535, got 99999
+           exit=1
+
+  In steps 19-22 the listener never binds — the failure happens in init(),
+  before any port opens. Fail at startup, not at first request.
+
+
+--- STEP 23 ------------------------------------------------------------------
+Logs are structured JSON on stdout, carrying application_id.
+
+  RUN:     docker compose logs credit-scoring | tail -5
+
+  EXPECT:  {"time":"...", "level":"INFO", "module":"kifaru/credit_scoring",
+            "message":"credit-scoring started", "port":8081,
+            "log_level":"info", "approval_threshold":650}
+           {"time":"...", "level":"INFO", ..., "message":"application scored",
+            "application_id":"APP-100244", "score":712, "decision":"APPROVED"}
+
+  CHECK:   the startup line proves which settings the process actually came up
+           with, and every loan-related line carries application_id (§2.5).
+
+
+===============================================================================
+ CONTAINER HARDENING
+===============================================================================
+
+--- STEP 24 ------------------------------------------------------------------
+The hardening check.  [CHECKPOINT 3 of 4]
+
+  RUN:     make verify-hardened
+
+  EXPECT:  credit-scoring           PASS
+
+  This rehearses the Act 4 live edit. If it is green, that part of the demo
+  cannot fail.
+
+
+--- STEP 25 ------------------------------------------------------------------
+Confirm it really runs as a non-root NUMERIC uid.
+
+  RUN:     docker run --rm --entrypoint sh kifaru/credit-scoring:local -c 'id'
+
+  EXPECT:  uid=10001 gid=10001 groups=10001
+
+  Numeric, not a name — Kubernetes runAsNonRoot cannot verify a username (§11).
+
+
+--- STEP 26 ------------------------------------------------------------------
+Confirm the root filesystem is genuinely read-only.
+
+  RUN:     docker run --rm --read-only --tmpfs /tmp --user 10001:10001 \
+             --entrypoint sh kifaru/credit-scoring:local \
+             -c 'touch /probe 2>&1; touch /tmp/probe && echo "tmp writable OK"'
+
+  EXPECT:  touch: cannot touch '/probe': Read-only file system
+           tmp writable OK
+
+  Nothing is written at runtime except /tmp. The JVM needs a writable temp dir,
+  which is why /tmp is tmpfs and java.io.tmpdir points at it — without that the
+  JVM will not start read-only.
+
+
+===============================================================================
+ NOTES — background, not steps
+===============================================================================
+
+NOTE 1 — "error: LOG_LEVEL is required but was not set"
+  This is the most common surprise, and it is CORRECT behaviour (it is what
+  step 19 tests). §3.2 requires failing loudly at startup rather than silently
+  defaulting. To run locally:
+
+      cd app/credit-scoring && LOG_LEVEL=info bal run
+
+  `bal test` hits it too, because it executes module init(). `make test` sets
+  the variable for you. The container never hits it — the Dockerfile sets
+  LOG_LEVEL=info as a default.
+
+NOTE 2 — why there is no Config.toml
+  §3.2 forbids one: a config file baked into the image cannot vary across the
+  three environments the same image is promoted through. JSON logging is turned
+  on with the env var BAL_CONFIG_VAR_BALLERINA_LOG_FORMAT=json instead, set in
+  the Dockerfile. Locally, add it to see the same output:
+
+      LOG_LEVEL=info BAL_CONFIG_VAR_BALLERINA_LOG_FORMAT=json bal run
+
+NOTE 3 — /metrics returns 404  (known deviation, open with the spec author)
+  §7.2 lists /metrics as a service endpoint, but §3.2 says use Ballerina's
+  BUILT-IN Prometheus metrics and add no libraries — and the runtime serves
+  those on its own observability port (9797), not on 8081. Not a Phase 2
+  checkpoint.
+
+NOTE 4 — image size 375MB  (known deviation)
+  §11 expects "roughly 200-300MB" and says it is not worth fighting. The
+  runtime image carries only a slim JRE plus the jar; the ~1GB Ballerina
+  distribution stays in the builder stage.
+
+      docker images kifaru/credit-scoring:local --format '{{.Size}}'
+
+NOTE 5 — rebuilding after a code change
+
+      make up                                    # rebuilds what changed
+      docker compose up -d --build credit-scoring  # or just this service
+
+NOTE 6 — where this runs
+  Everything runs inside the Colima VM (6 CPU / 10 GiB). Ports are forwarded,
+  so localhost:8081 works from macOS directly. If docker commands fail after a
+  reboot the VM is stopped, not broken — `colima start`, or `make doctor` will
+  tell you which.
+
+NOTE 7 — what Phase 2 does NOT cover
+  loan-api calling this service (phase 3), the full smoke script (phase 3
+  onward), NATS, the database, and the arrears job. Phase 1's data-layer steps
+  are in demo/PHASE1-MANUAL-TESTS.txt and still apply.
+
+===============================================================================

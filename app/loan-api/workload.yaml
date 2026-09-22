@@ -1,0 +1,41 @@
+apiVersion: openchoreo.dev/v1alpha1
+
+metadata:
+  name: loan-api
+
+endpoints:
+  - name: http
+    port: 8080
+    type: HTTP
+    visibility:
+      - external          # public-api REQUIRES at least one external endpoint
+
+configurations:
+  env:
+    # `name:`, NOT `key:`. The Workload CR uses `key:`; this descriptor uses
+    # `name:`, and a `key:` here is accepted silently and generates env entries
+    # with an EMPTY name -- the container then starts with no LOG_LEVEL and dies
+    # with "LOG_LEVEL is required but was not set".
+    - name: PORT
+      value: "8080"
+    - name: LOG_LEVEL
+      value: info
+    - name: SCORING_TIMEOUT_MS
+      value: "2000"
+    - name: BAL_CONFIG_VAR_BALLERINA_LOG_FORMAT
+      value: json
+
+dependencies:
+  resources:
+    - ref: loans-db
+      envBindings:
+        url: DATABASE_URL
+    - ref: loan-events
+      envBindings:
+        url: NATS_URL
+  endpoints:
+    - component: credit-scoring
+      name: http
+      visibility: project
+      envBindings:
+        address: CREDIT_SCORING_URL

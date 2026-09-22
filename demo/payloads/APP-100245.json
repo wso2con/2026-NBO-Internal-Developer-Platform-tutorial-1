@@ -1,0 +1,12 @@
+{
+  "application_id": "APP-100245",
+  "applicant_name": "Brian K.",
+  "national_id": "23456789",
+  "wallet_msisdn": "254798765432",
+  "amount_kes": 300000,
+  "term_months": 24,
+  "monthly_income": 38000,
+  "employment_months": 24,
+  "kyc_verified": true,
+  "existing_defaults": 0
+}

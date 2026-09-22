@@ -1,0 +1,19 @@
+# P1 — the tenancy boundary: one namespace for the bank's lending platform.
+#
+# Everything the platform team defines for this tenant lives here — the project
+# type, the component types, the resource types, the environments, the pipeline.
+# The namespace IS the boundary: another tenant on the same cluster gets its own
+# namespace with its own types, and neither can see the other.
+#
+# apiVersion MUST be openchoreo.dev/v1alpha1, NOT the core v1 you would use with
+# kubectl: occ rejects the core group with
+#   unsupported apiVersion "v1" (expected group "openchoreo.dev")
+# occ applies the openchoreo.dev/control-plane label itself.
+#
+# No pod ever runs in this namespace. It holds records: Projects, Components,
+# Environments, the pipeline. Workloads run in cells (see 04).
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Namespace
+metadata:
+  name: kifaru-bank

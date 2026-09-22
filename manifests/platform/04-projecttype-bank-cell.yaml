@@ -1,0 +1,148 @@
+# P4 — what a "cell" is at this bank.
+#
+# A Project has no infrastructure of its own. It references a ProjectType, and
+# THIS is what gets materialised into each environment. The shipped `default`
+# type renders one bare namespace -- its own description says to start here when
+# "no additional shared infrastructure (NetworkPolicies, ResourceQuotas,
+# baseline RBAC) is needed". A bank is the case where it is needed.
+#
+# ${metadata.namespace} is the CELL namespace (dp-kifaru-bank-<project>-<env>-<hash>),
+# never `kifaru-bank`. If you need the latter inside a template it is
+# ${metadata.projectNamespace}.
+#
+# THE ONE RULE: resources[] must declare a v1/Namespace whose metadata.name is
+# literally ${metadata.namespace}, never guarded by includeWhen. Omit it and the
+# ProjectReleaseBinding reports Synced=False, Reason=NamespaceMissing and nothing
+# is applied.
+#
+# WHY THERE IS NO ResourceQuota HERE -- two reasons, both found by testing:
+#   1. The shipped postgres / nats / valkey ResourceTypes set only limits.memory,
+#      no CPU request. A quota with requests.cpu in `hard` makes CPU requests
+#      MANDATORY for every pod in the namespace, so the database, broker and cache
+#      would be rejected outright:
+#        pods "loans-db-0" is forbidden: failed quota: cell-quota:
+#        must specify requests.cpu
+#      (memory survives -- Kubernetes copies limits.memory into requests.memory.)
+#   2. The data-plane agent's ClusterRole cannot create resourcequotas anyway, so
+#      a quota needs an additive cluster-RBAC grant before it will apply at all.
+#
+# If you ever do want one, the safe form is a pod COUNT only (`pods: "30"`, no
+# requests.* keys) plus that RBAC grant. The isolation story this demo actually
+# rests on is the two NetworkPolicies below, which the agent can already apply.
+#
+# NETWORK POLICY ENFORCEMENT DEPENDS ON THE CLUSTER. Tested on k3d (k3s runs its
+# embedded controller; there is no --disable-network-policy flag): with a
+# default-deny in place, a cross-namespace request is refused and a same-namespace
+# one succeeds. On EKS the VPC CNI enforces NetworkPolicy only when the addon is
+# configured with enableNetworkPolicy=true; otherwise these render but do nothing.
+# Check before you claim isolation:  kubectl -n kube-system get ds aws-node -o yaml
+# | grep enable-network-policy. Either way the gateway exception below is what
+# keeps externally published components reachable once enforcement is on.
+#
+# TIMING: the controller syncs source pod IPs into ipsets, and a pod that sends
+# traffic within a second or two of starting can be denied until that sync lands.
+# Measured on an idle cluster: brand-new pods were refused; the same pods 45s
+# later succeeded. Services must retry their first calls -- do not read an early
+# connection refusal as a broken policy.
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ProjectType
+metadata:
+  name: bank-cell
+  namespace: kifaru-bank
+  annotations:
+    openchoreo.dev/display-name: Kifaru Bank Cell
+    openchoreo.dev/description: >-
+      An isolated, capped, default-deny cell. Every Kifaru Bank project uses it.
+spec:
+  # What a developer MUST declare about a project before it gets a cell.
+  parameters:
+    openAPIV3Schema:
+      type: object
+      required: [costCentre, dataClassification]
+      properties:
+        costCentre:
+          type: string
+          pattern: '^CC-[0-9]{4}$'
+          description: Finance cost centre, stamped onto every cell for chargeback.
+        dataClassification:
+          type: string
+          enum: [public, internal, confidential]
+          default: confidential
+
+  # What a developer may vary PER ENVIRONMENT -- and nothing else.
+  environmentConfigs:
+    openAPIV3Schema:
+      type: object
+      properties:
+        namespaceLabels:
+          type: object
+          additionalProperties:
+            type: string
+          default: {}
+
+  validations:
+    - rule: ${parameters.dataClassification != "public"}
+      message: >-
+        No project at this bank is classified public. Customer data is
+        confidential by default; use "internal" only with a DPO exemption.
+
+  resources:
+    # 1. THE CELL NAMESPACE -- mandatory, never guarded
+    - id: cell-namespace
+      template:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: ${metadata.namespace}
+          labels: ${oc_merge(metadata.labels, environmentConfigs.namespaceLabels)}
+          annotations:
+            bank.kifaru/cost-centre: ${parameters.costCentre}
+            bank.kifaru/data-classification: ${parameters.dataClassification}
+
+    # 2. DEFAULT DENY -- the isolation story at the network layer.
+    - id: cell-default-deny
+      template:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: default-deny-ingress
+          namespace: ${metadata.namespace}
+        spec:
+          podSelector: {}
+          policyTypes: [Ingress]
+
+    # 3. ...with exactly two holes.
+    #
+    # (a) podSelector: {} -- pods in the SAME cell may talk to each other.
+    #     loan-api -> credit-scoring, the worker -> the payment rail, everything
+    #     -> postgres/nats/valkey. Without this the application cannot function.
+    #
+    # (b) the GATEWAY namespace -- without this NOTHING is reachable from
+    #     outside, including loan-api and both web frontends. The gateway
+    #     (gateway-default) runs in openchoreo-data-plane, which is NOT the cell,
+    #     so default-deny blocks it like any other stranger. Symptom: the route
+    #     exists, occ shows the component Ready, and every request times out.
+    #
+    #     Confirm the gateway's namespace before trusting this value:
+    #       occ clusterdataplane get default      # spec.gateway.ingress.external.namespace
+    #
+    # This does NOT re-expose credit-scoring. internal-engine has no
+    # httproute-external template at all, so the gateway has no route to it --
+    # the ComponentType closes that door, not this policy.
+    - id: cell-allow-intra
+      template:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: allow-same-cell-and-gateway
+          namespace: ${metadata.namespace}
+        spec:
+          podSelector: {}
+          policyTypes: [Ingress]
+          ingress:
+            - from:
+                - podSelector: {}
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: openchoreo-data-plane

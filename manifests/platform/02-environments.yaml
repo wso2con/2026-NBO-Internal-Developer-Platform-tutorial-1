@@ -1,0 +1,45 @@
+# P2 — three environments, all on the shipped ClusterDataPlane/default.
+#
+# TWO GUARDRAILS:
+#   * dataPlaneRef is IMMUTABLE. Re-pointing an environment means delete and
+#     recreate, plus re-binding everything already deployed. Decide now.
+#   * isProduction is easy to forget and NOT cosmetic. Omit it and
+#     `occ environment list` shows PRODUCTION=false for production. Unlike
+#     dataPlaneRef it CAN be fixed by a later apply.
+#
+# gateway: {} means "inherit the data plane's gateway". The external route for
+# the web frontends comes from there.
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Environment
+metadata:
+  name: development
+  namespace: kifaru-bank
+spec:
+  dataPlaneRef:
+    kind: ClusterDataPlane
+    name: default
+  gateway: {}
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Environment
+metadata:
+  name: staging
+  namespace: kifaru-bank
+spec:
+  dataPlaneRef:
+    kind: ClusterDataPlane
+    name: default
+  gateway: {}
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Environment
+metadata:
+  name: production
+  namespace: kifaru-bank
+spec:
+  dataPlaneRef:
+    kind: ClusterDataPlane
+    name: default
+  gateway: {}
+  isProduction: true
